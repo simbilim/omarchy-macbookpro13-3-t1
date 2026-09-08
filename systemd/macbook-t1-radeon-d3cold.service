@@ -1,0 +1,14 @@
+[Unit]
+Description=Keep MacBookPro13,3 Radeon dGPU out of D3cold
+DefaultDependencies=no
+After=sysinit.target
+Before=display-manager.service multi-user.target
+ConditionPathExists=/sys/bus/pci/devices/0000:01:00.0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '[ -w /sys/bus/pci/devices/0000:01:00.0/d3cold_allowed ] && echo 0 > /sys/bus/pci/devices/0000:01:00.0/d3cold_allowed; [ -w /sys/bus/pci/devices/0000:01:00.0/power/control ] && echo on > /sys/bus/pci/devices/0000:01:00.0/power/control; exit 0'
+
+[Install]
+WantedBy=multi-user.target

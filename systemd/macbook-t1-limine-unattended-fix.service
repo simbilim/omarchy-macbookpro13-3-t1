@@ -1,0 +1,7 @@
+[Unit]
+Description=Keep Limine unattended after Omarchy boot config rewrites
+ConditionPathExists=/boot/limine.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/macbook-t1-limine-unattended-fix

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -u
+
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/macbook-t1-omarchy"
+mkdir -p "$state_dir"
+log_file="$state_dir/macbook-t1-omarchy-post-update.log"
+
+{
+  echo "== $(date -Is) post-update guard =="
+  if command -v sudo >/dev/null 2>&1; then
+    sudo /usr/local/sbin/macbook-t1-omarchy-maintain post-update
+  else
+    echo "FAIL: sudo missing"
+    exit 1
+  fi
+} >>"$log_file" 2>&1

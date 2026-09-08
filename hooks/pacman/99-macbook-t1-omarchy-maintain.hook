@@ -1,0 +1,24 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = linux
+Target = linux-headers
+Target = linux-firmware
+Target = linux-firmware-broadcom
+Target = networkmanager
+Target = wireless-regdb
+Target = dkms
+Target = limine
+Target = limine-mkinitcpio-hook
+Target = omarchy
+Target = sddm
+Target = hyprland
+Target = aquamarine
+Target = rtkit
+
+[Action]
+Description = Reapplying MacBookPro13,3 T1 Omarchy survival fixes...
+When = PostTransaction
+Exec = /usr/local/sbin/macbook-t1-omarchy-maintain pacman-hook
+NeedsTargets

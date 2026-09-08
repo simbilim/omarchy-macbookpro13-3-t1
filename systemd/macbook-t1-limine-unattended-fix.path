@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch Limine config for MacBookPro13,3 unattended defaults
+
+[Path]
+PathChanged=/boot/limine.conf
+PathModified=/boot/limine.conf
+Unit=macbook-t1-limine-unattended-fix.service
+
+[Install]
+WantedBy=multi-user.target

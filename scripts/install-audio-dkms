@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+driver_url="${AUDIO_DRIVER_URL:-https://github.com/davidjo/snd_hda_macbookpro.git}"
+driver_commit="${AUDIO_DRIVER_COMMIT:-89b22ff90b86468b186706861dd18663562defa7}"
+source_dir="${AUDIO_DRIVER_SOURCE_DIR:-/opt/macbook-t1/snd_hda_macbookpro-$driver_commit}"
+dkms_source="/usr/src/snd_hda_macbookpro-0.1"
+managed_marker=".macbook-t1-omarchy-managed"
+
+if (( EUID != 0 )); then
+  exec sudo bash "$0" "$@"
+fi
+
+fail() {
+  echo "FAIL: $*" >&2
+  exit 1
+}
+
+if [[ ! "$driver_commit" =~ ^[0-9a-f]{40}$ ]]; then
+  fail "AUDIO_DRIVER_COMMIT must be a full lowercase 40-character SHA"
+fi
+
+case "$driver_url" in
+  https://*) ;;
+  *) fail "AUDIO_DRIVER_URL must use https:// for privileged installs" ;;
+esac
+
+if command -v pacman >/dev/null 2>&1; then
+  pacman -S --needed --noconfirm git dkms linux-headers base-devel
+fi
+
+assert_trusted_dir_path() {
+  local path="$1" current="/" component uid mode
+
+  [[ "$path" = /* ]] || fail "path must be absolute: $path"
+  IFS='/' read -r -a components <<<"${path#/}"
+  for component in "${components[@]}"; do
+    [[ -n "$component" ]] || continue
+    current="${current%/}/$component"
+    if [[ -L "$current" ]]; then
+      fail "refusing symlink in privileged path: $current"
+    fi
+    if [[ -e "$current" ]]; then
+      [[ -d "$current" ]] || fail "path component is not a directory: $current"
+      uid="$(stat -c '%u' "$current")"
+      mode="$(stat -c '%a' "$current")"
+      if [[ "$uid" != 0 ]] || (( (8#$mode & 022) != 0 )); then
+        fail "refusing untrusted directory permissions: $current"
+      fi
+    else
+      break
+    fi
+  done
+}
+
+if [[ "$source_dir" != /* ]]; then
+  fail "AUDIO_DRIVER_SOURCE_DIR must be absolute"
+fi
+
+source_parent="$(dirname "$source_dir")"
+assert_trusted_dir_path "$source_parent"
+install -d -m 0755 -o root -g root "$source_parent"
+assert_trusted_dir_path "$source_parent"
+
+staging="$(mktemp -d "$source_parent/.snd_hda_macbookpro.XXXXXX")"
+empty_template="$(mktemp -d "$source_parent/.git-template.XXXXXX")"
+cleanup_staging() {
+  [[ -n "${staging:-}" && -d "$staging" ]] && rm -rf --one-file-system "$staging"
+  [[ -n "${empty_template:-}" && -d "$empty_template" ]] && rm -rf --one-file-system "$empty_template"
+}
+trap cleanup_staging EXIT
+
+git -c init.templateDir="$empty_template" clone --no-checkout "$driver_url" "$staging"
+git -C "$staging" config core.hooksPath /dev/null
+git -C "$staging" fetch --tags origin
+git -C "$staging" checkout --detach --force "$driver_commit"
+actual_commit="$(git -C "$staging" rev-parse HEAD)"
+if [[ "$actual_commit" != "$driver_commit" ]]; then
+  fail "expected $driver_commit but checked out $actual_commit"
+fi
+if [[ -n "$(git -C "$staging" status --porcelain --untracked-files=all)" ]]; then
+  fail "refusing dirty audio driver staging checkout"
+fi
+
+printf 'driver_url=%s\ndriver_commit=%s\n' "$driver_url" "$driver_commit" >"$staging/$managed_marker"
+chown -R root:root "$staging"
+find "$staging" -type d -exec chmod 0755 {} +
+find "$staging" -type f -exec chmod go-w {} +
+
+if [[ -e "$source_dir" || -L "$source_dir" ]]; then
+  if [[ -L "$source_dir" || ! -d "$source_dir" ]]; then
+    fail "refusing unsafe existing AUDIO_DRIVER_SOURCE_DIR: $source_dir"
+  fi
+  assert_trusted_dir_path "$source_dir"
+  if [[ ! -f "$source_dir/$managed_marker" ]]; then
+    fail "refusing to replace unmanaged AUDIO_DRIVER_SOURCE_DIR: $source_dir"
+  fi
+  rm -rf --one-file-system "$source_dir"
+fi
+
+mv "$staging" "$source_dir"
+staging=""
+rm -rf --one-file-system "$empty_template"
+empty_template=""
+trap - EXIT
+
+source_real="$(readlink -f "$source_dir")"
+if [[ -e "$dkms_source" || -L "$dkms_source" ]]; then
+  if [[ -L "$dkms_source" ]]; then
+    dkms_real="$(readlink -f "$dkms_source" || true)"
+    if [[ "$dkms_real" != "$source_real" ]]; then
+      ln -sfn "$source_real" "$dkms_source"
+    fi
+  else
+    fail "refusing non-symlink DKMS source path: $dkms_source"
+  fi
+fi
+
+(
+  cd "$source_dir"
+  ./install.cirrus.driver.sh -i
+)
+
+if [[ ! -L "$dkms_source" ]]; then
+  fail "DKMS source link was not created: $dkms_source"
+fi
+if [[ "$(readlink -f "$dkms_source" || true)" != "$source_real" ]]; then
+  fail "DKMS source link does not point at persistent verified source: $dkms_source"
+fi
+
+dkms status || true
+echo "CS8409 audio driver install attempted from $driver_url at $driver_commit"

@@ -1,0 +1,799 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG_FILE="/var/log/macbook-t1-omarchy-maintain.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+exec >>"$LOG_FILE" 2>&1
+
+echo
+echo "== $(date -Is) macbook-t1-omarchy-maintain ${1:-manual} =="
+
+if (( EUID != 0 )); then
+  echo "FAIL: run as root"
+  exit 1
+fi
+
+env_OMARCHY_USER="${OMARCHY_USER-}"
+env_OMARCHY_ENABLE_AUTOLOGIN="${OMARCHY_ENABLE_AUTOLOGIN-}"
+env_OMARCHY_ENABLE_SSH="${OMARCHY_ENABLE_SSH-}"
+env_OMARCHY_ENABLE_REMOTE_MAINTENANCE="${OMARCHY_ENABLE_REMOTE_MAINTENANCE-}"
+env_OMARCHY_ENABLE_LID_HIBERNATE="${OMARCHY_ENABLE_LID_HIBERNATE-}"
+env_OMARCHY_ENABLE_BCM43602_5GHZ_WIFI="${OMARCHY_ENABLE_BCM43602_5GHZ_WIFI-}"
+env_OMARCHY_PRESERVE_LUKS_AUTO_UNLOCK="${OMARCHY_PRESERVE_LUKS_AUTO_UNLOCK-}"
+
+config_file="/etc/macbook-t1-omarchy.conf"
+if [[ -f "$config_file" ]]; then
+  if [[ -L "$config_file" ]]; then
+    echo "FAIL: refusing symlinked config file: $config_file"
+    exit 1
+  fi
+  config_uid="$(stat -c '%u' "$config_file")"
+  config_mode="$(stat -c '%a' "$config_file")"
+  if [[ "$config_uid" != 0 ]] || (( (8#$config_mode & 022) != 0 )); then
+    echo "FAIL: refusing unsafe config file permissions on $config_file"
+    exit 1
+  fi
+  while IFS='=' read -r key value; do
+    case "$key" in
+      ''|\#*) continue ;;
+      OMARCHY_USER)
+        OMARCHY_USER="$value"
+        ;;
+      OMARCHY_ENABLE_AUTOLOGIN|OMARCHY_ENABLE_SSH|OMARCHY_ENABLE_REMOTE_MAINTENANCE|OMARCHY_ENABLE_LID_HIBERNATE|OMARCHY_ENABLE_BCM43602_5GHZ_WIFI|OMARCHY_PRESERVE_LUKS_AUTO_UNLOCK)
+        if [[ "$value" != 0 && "$value" != 1 ]]; then
+          echo "FAIL: invalid boolean in $config_file: $key=$value"
+          exit 1
+        fi
+        printf -v "$key" '%s' "$value"
+        ;;
+      *)
+        echo "WARN: ignoring unknown config key in $config_file: $key"
+        ;;
+    esac
+  done <"$config_file"
+fi
+
+[[ -n "$env_OMARCHY_USER" ]] && OMARCHY_USER="$env_OMARCHY_USER"
+[[ -n "$env_OMARCHY_ENABLE_AUTOLOGIN" ]] && OMARCHY_ENABLE_AUTOLOGIN="$env_OMARCHY_ENABLE_AUTOLOGIN"
+[[ -n "$env_OMARCHY_ENABLE_SSH" ]] && OMARCHY_ENABLE_SSH="$env_OMARCHY_ENABLE_SSH"
+[[ -n "$env_OMARCHY_ENABLE_REMOTE_MAINTENANCE" ]] && OMARCHY_ENABLE_REMOTE_MAINTENANCE="$env_OMARCHY_ENABLE_REMOTE_MAINTENANCE"
+[[ -n "$env_OMARCHY_ENABLE_LID_HIBERNATE" ]] && OMARCHY_ENABLE_LID_HIBERNATE="$env_OMARCHY_ENABLE_LID_HIBERNATE"
+[[ -n "$env_OMARCHY_ENABLE_BCM43602_5GHZ_WIFI" ]] && OMARCHY_ENABLE_BCM43602_5GHZ_WIFI="$env_OMARCHY_ENABLE_BCM43602_5GHZ_WIFI"
+[[ -n "$env_OMARCHY_PRESERVE_LUKS_AUTO_UNLOCK" ]] && OMARCHY_PRESERVE_LUKS_AUTO_UNLOCK="$env_OMARCHY_PRESERVE_LUKS_AUTO_UNLOCK"
+
+detect_user() {
+  if [[ -n "${OMARCHY_USER:-}" && "${OMARCHY_USER:-}" != root ]]; then
+    printf '%s\n' "$OMARCHY_USER"
+    return 0
+  fi
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER:-}" != root ]]; then
+    printf '%s\n' "$SUDO_USER"
+    return 0
+  fi
+  if getent passwd 1000 >/dev/null 2>&1; then
+    getent passwd 1000 | cut -d: -f1
+    return 0
+  fi
+  return 1
+}
+
+RUN_USER="$(detect_user)" || {
+  echo "FAIL: could not detect Omarchy user; set OMARCHY_USER"
+  exit 1
+}
+RUN_GROUP="$(id -gn "$RUN_USER")"
+USER_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6 || true)"
+if [[ -z "$USER_HOME" || ! -d "$USER_HOME" ]]; then
+  echo "FAIL: invalid home for user $RUN_USER"
+  exit 1
+fi
+if ! command -v runuser >/dev/null 2>&1; then
+  echo "FAIL: runuser is required to write user configuration without root-owned home writes"
+  exit 1
+fi
+
+changed_initramfs=0
+state_dir="/var/lib/macbook-t1-omarchy"
+pending_uki_rebuild="$state_dir/pending-uki-rebuild"
+enable_autologin="${OMARCHY_ENABLE_AUTOLOGIN:-0}"
+enable_ssh="${OMARCHY_ENABLE_SSH:-0}"
+enable_remote_maintenance="${OMARCHY_ENABLE_REMOTE_MAINTENANCE:-0}"
+enable_lid_hibernate="${OMARCHY_ENABLE_LID_HIBERNATE:-0}"
+enable_bcm43602_5ghz_wifi="${OMARCHY_ENABLE_BCM43602_5GHZ_WIFI:-0}"
+preserve_luks_auto_unlock="${OMARCHY_PRESERVE_LUKS_AUTO_UNLOCK:-0}"
+
+for bool_name in enable_autologin enable_ssh enable_remote_maintenance enable_lid_hibernate enable_bcm43602_5ghz_wifi preserve_luks_auto_unlock; do
+  bool_value="${!bool_name}"
+  if [[ "$bool_value" != 0 && "$bool_value" != 1 ]]; then
+    echo "FAIL: invalid boolean value for $bool_name: $bool_value"
+    exit 1
+  fi
+done
+
+if [[ "$enable_remote_maintenance" == 1 && "$enable_lid_hibernate" == 1 ]]; then
+  echo "FAIL: remote maintenance conflicts with lid hibernate"
+  echo "INFO: remote maintenance ignores lid/idle events; lid hibernate is for mobile safety"
+  exit 1
+fi
+
+write_file() {
+  local path="$1" mode="$2" owner="$3" group="$4" tmp
+  tmp="$(mktemp)"
+  cat >"$tmp"
+  if [[ ! -f "$path" ]] || ! cmp -s "$tmp" "$path"; then
+    install -D -m "$mode" -o "$owner" -g "$group" "$tmp" "$path"
+    echo "updated: $path"
+  fi
+  rm -f "$tmp"
+}
+
+is_root_controlled_file() {
+  local path="$1" uid mode
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  uid="$(stat -c '%u' "$path")"
+  mode="$(stat -c '%a' "$path")"
+  [[ "$uid" == 0 ]] && (( (8#$mode & 022) == 0 ))
+}
+
+managed_file_matches_hash() {
+  local path="$1" hash_file="$2" expected actual
+  [[ -f "$path" && -f "$hash_file" ]] || return 1
+  read -r expected <"$hash_file" || return 1
+  actual="$(sha256sum "$path" | awk '{print $1}')"
+  [[ "$actual" == "$expected" ]]
+}
+
+is_macbookpro13_3_bcm43602() {
+  local model
+  model="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
+  [[ "$model" == "MacBookPro13,3" ]] || return 1
+  lspci -nn -d 14e4:43ba 2>/dev/null | grep -q 'Network controller'
+}
+
+stable_bcm43602_local_mac() {
+  local model machine_id hash
+  model="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
+  machine_id="$(cat /etc/machine-id 2>/dev/null || hostname)"
+  hash="$(printf '%s:%s:%s' "$machine_id" "$model" "brcmfmac43602" | sha256sum)"
+  hash="${hash%% *}"
+  printf '02:%s:%s:%s:%s:%s\n' "${hash:0:2}" "${hash:2:2}" "${hash:4:2}" "${hash:6:2}" "${hash:8:2}"
+}
+
+validate_bcm43602_nvram() {
+  local path="$1"
+  [[ -f "$path" ]] || return 1
+  grep -Eq '^devid=0x43ba$' "$path" &&
+    grep -Eq '^ccode=00$' "$path" &&
+    grep -Eq '^regrev=245$' "$path" &&
+    grep -Eq '^aa5g=7$' "$path" &&
+    grep -Eq '^txchain=7$' "$path" &&
+    grep -Eq '^rxchain=7$' "$path" &&
+    grep -Eq '^macaddr=([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$' "$path"
+}
+
+ensure_bcm43602_5ghz_wifi() {
+  local source="/usr/local/share/macbook-t1-omarchy/brcmfmac43602-pcie-source.txt"
+  local dest_dir="/usr/lib/firmware/updates/brcm"
+  local generic_dest="$dest_dir/brcmfmac43602-pcie.txt"
+  local dmi_dest="$dest_dir/brcmfmac43602-pcie.Apple Inc.-MacBookPro13,3.txt"
+  local nm_conf="/etc/NetworkManager/conf.d/90-macbook-t1-brcmfmac.conf"
+  local hash_file="$state_dir/brcmfmac43602-5ghz.sha256"
+  local mac tmp hash
+
+  if [[ "$enable_bcm43602_5ghz_wifi" != 1 ]]; then
+    if [[ -f "$hash_file" ]]; then
+      for path in "$generic_dest" "$dmi_dest"; do
+        if managed_file_matches_hash "$path" "$hash_file"; then
+          rm -f -- "$path"
+          echo "removed: $path"
+        fi
+      done
+      rm -f -- "$hash_file"
+    fi
+    if [[ -f "$nm_conf" ]] && grep -Fqx '# Managed by macbook-t1-omarchy' "$nm_conf"; then
+      rm -f -- "$nm_conf"
+      echo "removed: $nm_conf"
+    fi
+    return 0
+  fi
+
+  if ! is_macbookpro13_3_bcm43602; then
+    echo "FAIL: BCM43602 5 GHz Wi-Fi override is only enabled for MacBookPro13,3 with PCI 14e4:43ba"
+    exit 1
+  fi
+
+  if ! is_root_controlled_file "$source"; then
+    echo "FAIL: missing or unsafe BCM43602 NVRAM source: $source"
+    echo "INFO: install it with ./install.sh --enable-bcm43602-5ghz-wifi --bcm43602-nvram-file FILE"
+    exit 1
+  fi
+
+  tmp="$(mktemp)"
+  mac="$(stable_bcm43602_local_mac)"
+  awk -v mac="$mac" '
+    { sub(/\r$/, "") }
+    /^macaddr=/ { print "macaddr=" mac; seen=1; next }
+    { print }
+    END { if (!seen) print "macaddr=" mac }
+  ' "$source" >"$tmp"
+
+  if ! validate_bcm43602_nvram "$tmp"; then
+    rm -f "$tmp"
+    echo "FAIL: BCM43602 NVRAM source did not produce a valid managed override"
+    exit 1
+  fi
+
+  install -d -m 0755 -o root -g root "$dest_dir" "$state_dir"
+  for path in "$generic_dest" "$dmi_dest"; do
+    if [[ ! -f "$path" ]] || ! cmp -s "$tmp" "$path"; then
+      install -D -m 0644 -o root -g root "$tmp" "$path"
+      echo "updated: $path"
+    fi
+  done
+  hash="$(sha256sum "$tmp" | awk '{print $1}')"
+  printf '%s\n' "$hash" >"$hash_file"
+  chmod 0644 "$hash_file"
+  rm -f "$tmp"
+
+  write_file "$nm_conf" 0644 root root <<'EOF'
+# Managed by macbook-t1-omarchy
+[device-macbook-t1-bcm43602]
+match-device=interface-name:=wlp3s0,driver:brcmfmac
+wifi.scan-rand-mac-address=no
+
+[connection-macbook-t1-bcm43602]
+match-device=interface-name:=wlp3s0,driver:brcmfmac
+wifi.cloned-mac-address=permanent
+EOF
+}
+
+mark_uki_rebuild_pending() {
+  local reason="$1"
+  install -d -m 0755 -o root -g root "$state_dir"
+  printf '%s\n' "$reason" >"$pending_uki_rebuild"
+  changed_initramfs=1
+}
+
+is_managed_or_legacy_autologin() {
+  local path="/etc/sddm.conf.d/autologin.conf" tmp result
+  [[ -f "$path" ]] || return 1
+  if grep -Fqx '# Managed by macbook-t1-omarchy' "$path"; then
+    return 0
+  fi
+  tmp="$(mktemp)"
+  {
+    printf '%s\n' '[Autologin]'
+    printf 'User=%s\n' "$RUN_USER"
+    printf '%s\n' 'Session=omarchy.desktop'
+  } >"$tmp"
+  cmp -s "$tmp" "$path"
+  result=$?
+  rm -f "$tmp"
+  return "$result"
+}
+
+run_as_desktop_user() {
+  runuser -u "$RUN_USER" -- env USER_HOME="$USER_HOME" bash -s
+}
+
+is_known_legacy_artifact() {
+  local path="$1" pattern
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  case "$path" in
+    /etc/systemd/system/codex-limine-unattended-fix.path|\
+    /etc/systemd/system/codex-limine-unattended-fix.service|\
+    /etc/boot/hooks/post.d/80-codex-macbook-rescue-defaults|\
+    /usr/local/sbin/codex-limine-unattended-fix)
+      pattern='codex-limine|limine|/boot/limine\.conf|Limine'
+      ;;
+    /etc/systemd/system/codex-dri-symlinks.service|\
+    /usr/local/sbin/codex-dri-symlinks)
+      pattern='codex-dri|dri|radeon-dgpu|intel-igpu|MacBookPro13,3'
+      ;;
+    /etc/systemd/system/omarchy-nvme-suspend-fix.service)
+      pattern='omarchy-nvme-suspend-fix|nvme|suspend|power/control'
+      ;;
+    /etc/systemd/system/codex-graphics-failsafe.service|\
+    /etc/systemd/system/codex-graphics-failsafe.timer|\
+    /usr/local/sbin/codex-graphics-failsafe)
+      pattern='codex-graphics-failsafe|graphics|failsafe|Hyprland|AQ_NO_MODIFIERS'
+      ;;
+    /etc/systemd/system/sddm.service.d/20-macbook-dri-ordering.conf)
+      pattern='macbook|MacBookPro13,3|dri|radeon|intel|rtkit'
+      ;;
+    /etc/systemd/logind.conf.d/99-codex-remote-maintenance.conf)
+      pattern='HandleLidSwitch=ignore|IdleAction=ignore|remote-maintenance|codex'
+      ;;
+    /etc/systemd/logind.conf.d/90-macbookpro13-3-lid-lock.conf)
+      pattern='HandleLidSwitch=lock|MacBookPro13,3|macbookpro13-3'
+      ;;
+    /etc/pacman.d/hooks/99-codex-macbook-t1-maintain.hook)
+      pattern='codex|macbook-t1|omarchy|pacman-hook'
+      ;;
+    /usr/local/sbin/codex-macbook-t1-maintain)
+      pattern='codex|macbook-t1|MacBookPro13,3|omarchy|limine|dri'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  LC_ALL=C grep -Eaq "$pattern" "$path"
+}
+
+disable_known_legacy_unit() {
+  local unit="$1" fragment
+  fragment="$(systemctl show "$unit" -p FragmentPath --value 2>/dev/null || true)"
+  [[ -n "$fragment" ]] || return 0
+  if is_known_legacy_artifact "$fragment"; then
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  else
+    echo "WARN: preserving unknown legacy unit content: $fragment"
+  fi
+}
+
+remove_known_legacy_path() {
+  local path="$1"
+  [[ -e "$path" || -L "$path" ]] || return 0
+  if [[ -L "$path" ]]; then
+    echo "WARN: preserving symlinked legacy path: $path"
+    return 0
+  fi
+  if is_known_legacy_artifact "$path"; then
+    rm -f -- "$path"
+    echo "removed legacy: $path"
+  else
+    echo "WARN: preserving unknown legacy path content: $path"
+  fi
+}
+
+cleanup_legacy_artifacts() {
+  local unit path
+
+  for unit in \
+    codex-limine-unattended-fix.path \
+    codex-dri-symlinks.service \
+    omarchy-nvme-suspend-fix.service \
+    codex-graphics-failsafe.timer; do
+    disable_known_legacy_unit "$unit"
+  done
+
+  for path in \
+    /etc/systemd/system/codex-limine-unattended-fix.path \
+    /etc/systemd/system/codex-limine-unattended-fix.service \
+    /etc/systemd/system/codex-dri-symlinks.service \
+    /etc/systemd/system/omarchy-nvme-suspend-fix.service \
+    /etc/systemd/system/codex-graphics-failsafe.service \
+    /etc/systemd/system/codex-graphics-failsafe.timer \
+    /etc/systemd/system/sddm.service.d/20-macbook-dri-ordering.conf \
+    /etc/systemd/logind.conf.d/99-codex-remote-maintenance.conf \
+    /etc/systemd/logind.conf.d/90-macbookpro13-3-lid-lock.conf \
+    /etc/boot/hooks/post.d/80-codex-macbook-rescue-defaults \
+    /etc/pacman.d/hooks/99-codex-macbook-t1-maintain.hook \
+    /usr/local/sbin/codex-macbook-t1-maintain \
+    /usr/local/sbin/codex-limine-unattended-fix \
+    /usr/local/sbin/codex-dri-symlinks \
+    /usr/local/sbin/codex-graphics-failsafe; do
+    remove_known_legacy_path "$path"
+  done
+
+  run_as_desktop_user <<'EOF'
+set -euo pipefail
+
+path="$USER_HOME/.config/omarchy/hooks/post-update.d/codex-macbook-t1-post-update"
+if [[ -e "$path" || -L "$path" ]]; then
+  if [[ -L "$path" ]]; then
+    echo "WARN: preserving symlinked legacy path: $path"
+  elif LC_ALL=C grep -Eaq 'codex|macbook-t1|MacBookPro13,3|omarchy-maintain' "$path"; then
+    rm -f -- "$path"
+    echo "removed legacy: $path"
+  else
+    echo "WARN: preserving unknown legacy path content: $path"
+  fi
+fi
+EOF
+}
+
+disable_omarchy_stay_awake() {
+  run_as_desktop_user <<'EOF'
+set -euo pipefail
+
+path="$USER_HOME/.local/state/omarchy/indicators/stay-awake"
+if [[ -e "$path" || -L "$path" ]]; then
+  rm -f -- "$path"
+  echo "removed mobile-unsafe stay-awake marker: $path"
+fi
+EOF
+}
+
+ensure_hypr_graphics_block() {
+  run_as_desktop_user <<'EOF'
+set -euo pipefail
+
+path="$USER_HOME/.config/hypr/hyprland.lua"
+install -d -m 0755 "$(dirname "$path")"
+if [[ -L "$path" ]]; then
+  echo "WARN: refusing symlinked Hyprland config: $path"
+  exit 0
+fi
+  touch "$path"
+  chmod 0644 "$path"
+  tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' EXIT
+  awk '
+    $0 == "-- BEGIN MacBookPro13,3 T1 graphics" { skip=1; next }
+    $0 == "-- END MacBookPro13,3 T1 graphics" { skip=0; next }
+    $0 == "-- BEGIN Codex MacBookPro13,3 T1 graphics" { skip=1; next }
+    $0 == "-- END Codex MacBookPro13,3 T1 graphics" { skip=0; next }
+    skip { next }
+    $0 == "-- Internal panel is wired to the Radeon GPU; avoid Intel/no-output scanout." { next }
+    $0 == "hl.env(\"AQ_DRM_DEVICES\", \"/dev/dri/radeon-dgpu\")" { next }
+    $0 == "-- Avoid modifier paths that can leave the internal eDP panel black on Aquamarine/AMDGPU." { next }
+    $0 == "hl.env(\"AQ_NO_MODIFIERS\", \"1\")" { next }
+    $0 == "hl.env(\"HYPRLAND_EGL_NO_MODIFIERS\", \"1\")" { next }
+    { print }
+  ' "$path" >"$tmp"
+  perl -0pi -e 's/\n+\z/\n/' "$tmp"
+  {
+    printf '%s\n' '-- BEGIN MacBookPro13,3 T1 graphics'
+    printf '%s\n' '-- Internal panel is wired to the Radeon GPU; avoid Intel/no-output scanout.'
+    printf '%s\n' 'hl.env("AQ_DRM_DEVICES", "/dev/dri/radeon-dgpu")'
+    printf '%s\n' '-- Avoid modifier paths that can leave the internal eDP panel black on Aquamarine/AMDGPU.'
+    printf '%s\n' 'hl.env("AQ_NO_MODIFIERS", "1")'
+    printf '%s\n' 'hl.env("HYPRLAND_EGL_NO_MODIFIERS", "1")'
+    printf '%s\n' '-- END MacBookPro13,3 T1 graphics'
+  } >>"$tmp"
+  if ! cmp -s "$tmp" "$path"; then
+    cp "$tmp" "$path"
+    echo "updated: $path MacBookPro13,3 graphics block"
+  fi
+  chmod 0644 "$path"
+EOF
+}
+
+ensure_omarchy_post_update_hook() {
+  run_as_desktop_user <<'EOF'
+set -euo pipefail
+
+path="$USER_HOME/.config/omarchy/hooks/post-update.d/macbook-t1-omarchy-maintain"
+install -d -m 0755 "$(dirname "$path")"
+if [[ -L "$path" ]]; then
+  echo "WARN: refusing symlinked Omarchy post-update hook: $path"
+  exit 0
+fi
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+cat >"$tmp" <<'HOOK'
+#!/usr/bin/env bash
+set -u
+
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/macbook-t1-omarchy"
+mkdir -p "$state_dir"
+log_file="$state_dir/macbook-t1-omarchy-post-update.log"
+
+{
+  echo "== $(date -Is) post-update guard =="
+  if command -v sudo >/dev/null 2>&1; then
+    sudo /usr/local/sbin/macbook-t1-omarchy-maintain post-update
+  else
+    echo "FAIL: sudo missing"
+    exit 1
+  fi
+} >>"$log_file" 2>&1
+HOOK
+chmod 0755 "$tmp"
+if [[ ! -f "$path" ]] || ! cmp -s "$tmp" "$path"; then
+  cp "$tmp" "$path"
+  chmod 0755 "$path"
+  echo "updated: $path"
+fi
+EOF
+}
+
+cleanup_legacy_artifacts
+
+write_file /usr/local/sbin/macbook-t1-limine-unattended-fix 0755 root root <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+conf="${LIMINE_CONF:-/boot/limine.conf}"
+timeout="${LIMINE_TIMEOUT:-1}"
+default_entry="${LIMINE_DEFAULT_ENTRY:-1}"
+strip_path_hashes="${LIMINE_STRIP_PATH_HASHES:-0}"
+[[ -f "$conf" ]] || exit 0
+[[ "$timeout" =~ ^[0-9]+$ ]] || exit 2
+[[ "$default_entry" =~ ^[0-9]+$ ]] || exit 2
+[[ "$strip_path_hashes" =~ ^[01]$ ]] || exit 2
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+TIMEOUT="$timeout" DEFAULT_ENTRY="$default_entry" STRIP_PATH_HASHES="$strip_path_hashes" perl -0pe '
+  if ($ENV{STRIP_PATH_HASHES} eq "1") {
+    s{(^[ \t]*path:[ \t]*boot\(\):/[^#\n]*)#[0-9a-fA-F]{128}}{$1}mg;
+  }
+  s{^timeout:\s*.*$}{"timeout: " . $ENV{TIMEOUT}}emg;
+  s{^default_entry:\s*.*$}{"default_entry: " . $ENV{DEFAULT_ENTRY}}emg;
+' "$conf" >"$tmp"
+if ! cmp -s "$tmp" "$conf"; then
+  cp "$conf" "$conf.before-macbook-t1-unattended-$(date +%Y%m%d-%H%M%S)" || true
+  cp "$tmp" "$conf"
+  echo "updated: $conf"
+fi
+EOF
+
+write_file /etc/boot/hooks/post.d/80-macbook-t1-rescue-defaults 0755 root root <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+/usr/local/sbin/macbook-t1-limine-unattended-fix
+EOF
+
+write_file /etc/systemd/system/macbook-t1-limine-unattended-fix.service 0644 root root <<'EOF'
+[Unit]
+Description=Keep Limine unattended after Omarchy boot config rewrites
+ConditionPathExists=/boot/limine.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/macbook-t1-limine-unattended-fix
+EOF
+
+write_file /etc/systemd/system/macbook-t1-limine-unattended-fix.path 0644 root root <<'EOF'
+[Unit]
+Description=Watch Limine config for MacBookPro13,3 unattended defaults
+
+[Path]
+PathChanged=/boot/limine.conf
+PathModified=/boot/limine.conf
+Unit=macbook-t1-limine-unattended-fix.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+write_file /etc/limine-entry-tool.d/macbook13-stability.conf 0644 root root <<'EOF'
+# MacBookPro13,3 stability: preserve Radeon rescue flags through Omarchy-generated Limine/UKI updates.
+KERNEL_CMDLINE[default]+=" amdgpu.runpm=0 amdgpu.aspm=0 amdgpu.bapm=0 radeon.runpm=0 pcie_aspm=off"
+EOF
+
+write_file /etc/systemd/system/macbook-t1-radeon-d3cold.service 0644 root root <<'EOF'
+[Unit]
+Description=Keep MacBookPro13,3 Radeon dGPU out of D3cold
+DefaultDependencies=no
+After=sysinit.target
+Before=display-manager.service multi-user.target
+ConditionPathExists=/sys/bus/pci/devices/0000:01:00.0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '[ -w /sys/bus/pci/devices/0000:01:00.0/d3cold_allowed ] && echo 0 > /sys/bus/pci/devices/0000:01:00.0/d3cold_allowed; [ -w /sys/bus/pci/devices/0000:01:00.0/power/control ] && echo on > /sys/bus/pci/devices/0000:01:00.0/power/control; exit 0'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+write_file /usr/local/sbin/macbook-t1-dri-symlinks 0755 root root <<'EOF'
+#!/usr/bin/env sh
+set -u
+mkdir -p /dev/dri
+for _ in $(seq 1 80); do
+  for card in /sys/bus/pci/devices/0000:00:02.0/drm/card[0-9]*; do
+    [ -e "$card" ] || continue
+    node=${card##*/}
+    [ -e "/dev/dri/$node" ] && ln -sfn "$node" /dev/dri/intel-igpu
+  done
+  for card in /sys/bus/pci/devices/0000:01:00.0/drm/card[0-9]*; do
+    [ -e "$card" ] || continue
+    node=${card##*/}
+    if [ -e "/dev/dri/$node" ]; then
+      ln -sfn "$node" /dev/dri/radeon-dgpu
+      exit 0
+    fi
+  done
+  sleep 0.25
+done
+exit 0
+EOF
+
+write_file /etc/systemd/system/macbook-t1-dri-symlinks.service 0644 root root <<'EOF'
+[Unit]
+Description=Create stable MacBookPro13,3 DRI symlinks before the display manager
+DefaultDependencies=no
+After=systemd-udevd.service systemd-udev-trigger.service macbook-t1-radeon-d3cold.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/macbook-t1-dri-symlinks
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+write_file /etc/udev/rules.d/61-macbook-t1-gpu-names.rules 0644 root root <<'EOF'
+# Stable DRM device names for MacBookPro13,3 hybrid graphics.
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", KERNELS=="0000:00:02.0", SYMLINK+="dri/intel-igpu"
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", KERNELS=="0000:01:00.0", SYMLINK+="dri/radeon-dgpu"
+EOF
+
+write_file /etc/systemd/system/sddm.service.d/20-macbook-t1-dri-ordering.conf 0644 root root <<'EOF'
+[Unit]
+Wants=macbook-t1-dri-symlinks.service rtkit-daemon.service
+After=macbook-t1-dri-symlinks.service macbook-t1-radeon-d3cold.service rtkit-daemon.service
+EOF
+
+if [[ "$enable_autologin" == 1 ]]; then
+  write_file /etc/sddm.conf.d/autologin.conf 0644 root root <<EOF
+# Managed by macbook-t1-omarchy
+[Autologin]
+User=$RUN_USER
+Session=omarchy.desktop
+EOF
+elif [[ -f /etc/sddm.conf.d/autologin.conf ]] &&
+  is_managed_or_legacy_autologin; then
+  rm -f /etc/sddm.conf.d/autologin.conf
+  echo "removed: /etc/sddm.conf.d/autologin.conf"
+fi
+
+write_file /usr/local/share/wayland-sessions/omarchy.desktop 0644 root root <<'EOF'
+[Desktop Entry]
+Name=Omarchy (Hyprland uwsm)
+Comment=Omarchy Hyprland session managed by uwsm
+Exec=uwsm start -g -1 -e -D Hyprland hyprland.desktop
+TryExec=uwsm
+Type=Application
+EOF
+
+if [[ "$enable_remote_maintenance" == 1 ]]; then
+  write_file /etc/systemd/logind.conf.d/99-macbook-t1-remote-maintenance.conf 0644 root root <<'EOF'
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+IdleAction=ignore
+EOF
+else
+  rm -f /etc/systemd/logind.conf.d/99-macbook-t1-remote-maintenance.conf
+fi
+
+if [[ "$enable_lid_hibernate" == 1 ]]; then
+  remove_known_legacy_path /etc/systemd/logind.conf.d/90-macbookpro13-3-lid-lock.conf
+  write_file /etc/systemd/logind.conf.d/90-macbook-t1-mobile-lid.conf 0644 root root <<'EOF'
+[Login]
+# Mobile safety: this model has a known-bad S3 suspend path, so close-lid uses
+# hibernate instead of leaving the machine running hot in a bag.
+HandleLidSwitch=hibernate
+HandleLidSwitchExternalPower=hibernate
+HandleLidSwitchDocked=ignore
+EOF
+  if [[ "$enable_remote_maintenance" == 0 ]]; then
+    disable_omarchy_stay_awake
+  fi
+else
+  rm -f /etc/systemd/logind.conf.d/90-macbook-t1-mobile-lid.conf
+fi
+
+ensure_bcm43602_5ghz_wifi
+
+write_file /etc/pacman.d/hooks/99-macbook-t1-omarchy-maintain.hook 0644 root root <<'EOF'
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = linux
+Target = linux-headers
+Target = linux-firmware
+Target = linux-firmware-broadcom
+Target = networkmanager
+Target = wireless-regdb
+Target = dkms
+Target = limine
+Target = limine-mkinitcpio-hook
+Target = omarchy
+Target = sddm
+Target = hyprland
+Target = aquamarine
+Target = rtkit
+
+[Action]
+Description = Reapplying MacBookPro13,3 T1 Omarchy survival fixes...
+When = PostTransaction
+Exec = /usr/local/sbin/macbook-t1-omarchy-maintain pacman-hook
+NeedsTargets
+EOF
+
+ensure_omarchy_post_update_hook
+
+if [[ "$preserve_luks_auto_unlock" == 1 && -f /crypto_keyfile.bin ]]; then
+  chmod 000 /crypto_keyfile.bin
+  chown root:root /crypto_keyfile.bin
+  if [[ ! -f /etc/mkinitcpio.conf.d/zz-macbook-t1-luks-keyfile.conf ]] ||
+    ! grep -Fq 'FILES+=(/crypto_keyfile.bin)' /etc/mkinitcpio.conf.d/zz-macbook-t1-luks-keyfile.conf; then
+    write_file /etc/mkinitcpio.conf.d/zz-macbook-t1-luks-keyfile.conf 0644 root root <<'EOF'
+# Optional delegated-maintenance auto-unlock.
+# /crypto_keyfile.bin is embedded into the UKI; remove this file and kill
+# its LUKS keyslot to restore normal pre-boot disk-password protection.
+FILES+=(/crypto_keyfile.bin)
+EOF
+    mark_uki_rebuild_pending "added /crypto_keyfile.bin mkinitcpio drop-in"
+  fi
+else
+  for keyfile_dropin in \
+    /etc/mkinitcpio.conf.d/zz-macbook-t1-luks-keyfile.conf \
+    /etc/mkinitcpio.conf.d/zz-codex-luks-keyfile.conf; do
+    if [[ -f "$keyfile_dropin" ]] && grep -Fq 'FILES+=(/crypto_keyfile.bin)' "$keyfile_dropin"; then
+      rm -f "$keyfile_dropin"
+      mark_uki_rebuild_pending "removed $keyfile_dropin"
+      echo "removed: $keyfile_dropin"
+    fi
+  done
+  echo "INFO: LUKS auto-unlock is not enabled or preserved by default"
+fi
+
+ensure_hypr_graphics_block
+
+if command -v dkms >/dev/null 2>&1; then
+  dkms autoinstall || echo "WARN: dkms autoinstall failed"
+  dkms_out="$(dkms status || true)"
+  printf '%s\n' "$dkms_out"
+  if ! grep -q '^snd_hda_macbookpro/0[.]1,' <<<"$dkms_out"; then
+    echo "WARN: snd_hda_macbookpro/0.1 is not registered in DKMS"
+  fi
+  if ! grep -q '^apple-ib-drv/0[.]1,' <<<"$dkms_out"; then
+    echo "WARN: apple-ib-drv/0.1 is not registered in DKMS"
+  fi
+else
+  echo "WARN: dkms not installed"
+fi
+
+if [[ -x /usr/local/sbin/macbook-t1-limine-unattended-fix ]]; then
+  /usr/local/sbin/macbook-t1-limine-unattended-fix || echo "WARN: limine unattended fix failed"
+fi
+
+if [[ -f /boot/EFI/limine/limine_x64.efi ]]; then
+  install -d -m 0755 /boot/EFI/BOOT
+  if [[ ! -f /boot/EFI/BOOT/BOOTX64.EFI ]] ||
+    ! cmp -s /boot/EFI/limine/limine_x64.efi /boot/EFI/BOOT/BOOTX64.EFI; then
+    cp -f /boot/EFI/limine/limine_x64.efi /boot/EFI/BOOT/BOOTX64.EFI
+    echo "updated: /boot/EFI/BOOT/BOOTX64.EFI"
+  fi
+else
+  echo "WARN: /boot/EFI/limine/limine_x64.efi missing"
+fi
+
+systemctl daemon-reload
+if [[ "$enable_ssh" == 1 ]]; then
+  systemctl enable sshd.service >/dev/null 2>&1 || true
+fi
+systemctl enable sddm.service >/dev/null 2>&1 || true
+systemctl enable rtkit-daemon.service >/dev/null 2>&1 || true
+systemctl enable fstrim.timer >/dev/null 2>&1 || true
+systemctl enable t1-touchbar.service >/dev/null 2>&1 || true
+systemctl enable macbook-t1-radeon-d3cold.service >/dev/null 2>&1 || true
+systemctl enable macbook-t1-dri-symlinks.service >/dev/null 2>&1 || true
+systemctl enable --now macbook-t1-limine-unattended-fix.path >/dev/null 2>&1 || true
+
+if (( changed_initramfs )) || [[ -f "$pending_uki_rebuild" ]]; then
+  if ! command -v limine-mkinitcpio >/dev/null 2>&1; then
+    echo "FAIL: UKI rebuild is pending, but limine-mkinitcpio is unavailable"
+    exit 1
+  fi
+  echo "rebuilding UKI because mkinitcpio keyfile config changed"
+  if ! limine-mkinitcpio; then
+    echo "FAIL: limine-mkinitcpio failed; pending rebuild marker preserved at $pending_uki_rebuild"
+    exit 1
+  fi
+  if [[ -x /usr/local/sbin/macbook-t1-limine-unattended-fix ]]; then
+    /usr/local/sbin/macbook-t1-limine-unattended-fix
+  fi
+  rm -f "$pending_uki_rebuild"
+fi
+
+systemctl reset-failed >/dev/null 2>&1 || true
+
+echo "summary:"
+echo "system_state=$(systemctl is-system-running || true)"
+echo "failed_units=$(systemctl --failed --no-legend | wc -l | tr -d ' ')"
+echo "sddm=$(systemctl is-enabled sddm.service 2>/dev/null || true)/$(systemctl is-active sddm.service 2>/dev/null || true)"
+echo "limine_guard=$(systemctl is-enabled macbook-t1-limine-unattended-fix.path 2>/dev/null || true)/$(systemctl is-active macbook-t1-limine-unattended-fix.path 2>/dev/null || true)"
+echo "bcm43602_5ghz_wifi=$enable_bcm43602_5ghz_wifi"
+echo "audio_module=$(modinfo -F filename snd_hda_codec_cs8409 2>/dev/null || true)"
+echo "done"

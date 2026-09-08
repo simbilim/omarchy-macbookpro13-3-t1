@@ -1,0 +1,25 @@
+#!/usr/bin/env sh
+set -u
+
+mkdir -p /dev/dri
+
+for _ in $(seq 1 80); do
+  for card in /sys/bus/pci/devices/0000:00:02.0/drm/card[0-9]*; do
+    [ -e "$card" ] || continue
+    node=${card##*/}
+    [ -e "/dev/dri/$node" ] && ln -sfn "$node" /dev/dri/intel-igpu
+  done
+
+  for card in /sys/bus/pci/devices/0000:01:00.0/drm/card[0-9]*; do
+    [ -e "$card" ] || continue
+    node=${card##*/}
+    if [ -e "/dev/dri/$node" ]; then
+      ln -sfn "$node" /dev/dri/radeon-dgpu
+      exit 0
+    fi
+  done
+
+  sleep 0.25
+done
+
+exit 0

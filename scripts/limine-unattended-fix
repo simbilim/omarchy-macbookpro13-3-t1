@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+conf="${LIMINE_CONF:-/boot/limine.conf}"
+timeout="${LIMINE_TIMEOUT:-1}"
+default_entry="${LIMINE_DEFAULT_ENTRY:-1}"
+strip_path_hashes="${LIMINE_STRIP_PATH_HASHES:-0}"
+
+[[ -f "$conf" ]] || exit 0
+[[ "$timeout" =~ ^[0-9]+$ ]] || { echo "FAIL: LIMINE_TIMEOUT must be numeric" >&2; exit 2; }
+[[ "$default_entry" =~ ^[0-9]+$ ]] || { echo "FAIL: LIMINE_DEFAULT_ENTRY must be numeric" >&2; exit 2; }
+[[ "$strip_path_hashes" =~ ^[01]$ ]] || { echo "FAIL: LIMINE_STRIP_PATH_HASHES must be 0 or 1" >&2; exit 2; }
+
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+
+TIMEOUT="$timeout" DEFAULT_ENTRY="$default_entry" STRIP_PATH_HASHES="$strip_path_hashes" perl -0pe '
+  if ($ENV{STRIP_PATH_HASHES} eq "1") {
+    s{(^[ \t]*path:[ \t]*boot\(\):/[^#\n]*)#[0-9a-fA-F]{128}}{$1}mg;
+  }
+  s{^timeout:\s*.*$}{"timeout: " . $ENV{TIMEOUT}}emg;
+  s{^default_entry:\s*.*$}{"default_entry: " . $ENV{DEFAULT_ENTRY}}emg;
+' "$conf" >"$tmp"
+
+if ! cmp -s "$tmp" "$conf"; then
+  cp "$conf" "$conf.before-macbook-t1-unattended-$(date +%Y%m%d-%H%M%S)" || true
+  cp "$tmp" "$conf"
+  echo "updated: $conf"
+fi
