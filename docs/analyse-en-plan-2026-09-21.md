@@ -22,7 +22,11 @@ Hervattijd: in S3 komt het scherm na circa 2–3 s terug. De kernel-resume duurd
 
 De s2idle-vertraging is opgelost met de eigen DKMS-module `macbook-t1-tb-nod3`. Die zet `PCI_DEV_FLAGS_NO_D3` op de twee ingebouwde Alpine Ridge-upstreambruggen (`8086:1578`) en beide USB-C-xHCI's (`8086:15d4`) onder PEG1/PEG2, ook na de PCI-rescan via een busnotifier. Zonder D3 draaien hun trage `_PS3`/`_PS0` niet meer. Meting met ethernet en lader aangesloten: hervatten van 20,7 s (04:00.0 8,7 s, 7a:00.0 8,3 s, xHCI's 2 × 1,0 s) naar 1,0 s; ethernet, wifi en beide controllers bleven werken. `pcie_port_pm=off` is daardoor niet nodig. De helper zet het scherm nu aan vóór de rescan, wifi- en Thunderbolt-herlaadstappen, en herlaadt `brcmfmac` ook rond s2idle: na twee s2idle-cycli zonder herladen weigerde het accesspoint iedere associatie (status 16).
 
-Open: één losgekoppelde nachtmeting; `i915`-resume van 4,7 s in S3; S3 met alleen de lader aangesloten (de lader is geen USB-apparaat, dus de helper kiest dan S3).
+Nachtmeting 15→16 oktober: 16,4 uur S3, 5873 → 5862 mAh (89% → 89%). S3 met alleen de lader aangesloten werkt: beide controllers terug, accu laadt.
+
+De `i915`-resume van 4,7 s na S3 bestond uit circa 350 eDP-AUX-time-outs: de gmux-DDC/AUX-schakelaar wees na S3 nog naar de Radeon, omdat apple-gmux pas na i915 hervatte. De DKMS-module `macbook-t1-gmux-order` legt een device link aan met gmux als supplier van i915. Daarna: 0 AUX-time-outs, `i915` 0,50 s, kernelresume na S3 van 6,8 naar 2,75 s. Resterend: 1,0 s in `pci_pm_resume_noirq` van NVMe-root-port 00:1b.0.
+
+Open: geen blokkerende punten.
 
 ## Actuele analyse, 2 oktober 2026
 

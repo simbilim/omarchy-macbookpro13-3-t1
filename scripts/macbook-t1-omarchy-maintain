@@ -991,6 +991,9 @@ if command -v dkms >/dev/null 2>&1; then
   if ! grep -q '^macbook-t1-tb-nod3/0[.]1,' <<<"$dkms_out"; then
     echo "WARN: macbook-t1-tb-nod3/0.1 is not registered in DKMS (s2idle resume takes ~20 s)"
   fi
+  if ! grep -q '^macbook-t1-gmux-order/0[.]1,' <<<"$dkms_out"; then
+    echo "WARN: macbook-t1-gmux-order/0.1 is not registered in DKMS (panel takes ~5 s after S3)"
+  fi
 else
   echo "WARN: dkms not installed"
 fi

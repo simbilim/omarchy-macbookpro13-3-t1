@@ -36,6 +36,7 @@ put scripts/macbook-t1-touchbar-resume-fix /usr/local/sbin/macbook-t1-touchbar-r
 put scripts/install-ec-wake-dkms /usr/local/sbin/macbook-t1-install-ec-wake-dkms 0755
 put scripts/install-socw-dkms /usr/local/sbin/macbook-t1-install-socw-dkms 0755
 put scripts/install-tb-nod3-dkms /usr/local/sbin/macbook-t1-install-tb-nod3-dkms 0755
+put scripts/install-gmux-order-dkms /usr/local/sbin/macbook-t1-install-gmux-order-dkms 0755
 put scripts/macbook-t1-touchbar-display /usr/local/sbin/macbook-t1-touchbar-display 0755
 put systemd/macbook-t1-touchbar-display.service /etc/systemd/system/macbook-t1-touchbar-display.service 0644
 put scripts/macbook-t1-preferred-kernel /usr/local/sbin/macbook-t1-preferred-kernel 0755
@@ -74,6 +75,7 @@ sed -i 's/^OMARCHY_ENABLE_LID_HIBERNATE=1$/OMARCHY_ENABLE_LID_HIBERNATE=0/' "$co
 "$repo_dir/scripts/install-ec-wake-dkms"
 "$repo_dir/scripts/install-socw-dkms"
 "$repo_dir/scripts/install-tb-nod3-dkms"
+"$repo_dir/scripts/install-gmux-order-dkms"
 install -d -m 0700 /var/lib/macbook-t1-omarchy/efi-gpu
 touch /var/lib/macbook-t1-omarchy/efi-gpu/igd-boot-pending
 gpu_status=$(/usr/local/sbin/macbook-t1-gpu-pref status)
