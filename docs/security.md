@@ -75,11 +75,7 @@ sudo ./install.sh --user "$USER" --enable-ssh --enable-remote-maintenance
 
 Use key-only SSH, disable password authentication if possible, and turn these settings off after recovery if you do not need them.
 
-Remote-maintenance lid/idle overrides are unsafe for transport: they can keep a closed laptop running in a bag. On this model, S3 suspend is known to be unreliable, so use the explicit hibernate-on-lid-close option for mobile use:
-
-```bash
-sudo ./install.sh --user "$USER" --enable-lid-hibernate
-```
+Remote-maintenance lid/idle overrides are unsafe for transport: they can keep a closed laptop running in a bag. Hibernation also failed during the 9 September investigation, so the earlier recommendation to enable it has been withdrawn. See [the investigation](stability-2026-09-09.md) for the replacement profile and its validation status.
 
 The installer rejects combining remote maintenance and lid hibernate, because systemd drop-in ordering would otherwise make the higher-priority remote-maintenance ignore rules win.
 

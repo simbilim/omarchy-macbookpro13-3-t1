@@ -41,6 +41,25 @@ Expected DKMS line:
 snd_hda_macbookpro/0.1, KERNEL_VERSION, x86_64: installed
 ```
 
+The CS8409/CS42L83 path on this model is effectively a 44.1 kHz hardware path.
+The mobile profile installs this PipeWire drop-in so the PipeWire graph matches
+the codec instead of running the graph at 48 kHz and resampling at the sink:
+
+```text
+/etc/pipewire/pipewire.conf.d/90-macbook-t1-cs8409-rate.conf
+```
+
+The mobile profile also installs a conservative protected speaker sink:
+
+```text
+/etc/pipewire/pipewire.conf.d/91-macbook-t1-speaker-protect.conf
+```
+
+It keeps the desktop-facing sink stereo, adds headroom, cuts sub-bass, and
+trims the low band before sending audio to the real internal speaker sink. This
+does not reproduce Apple's per-speaker CoreAudio processing, but it reduces
+speaker stress on the current Linux stereo path.
+
 If sound is still missing:
 
 ```bash

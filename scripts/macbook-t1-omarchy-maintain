@@ -118,11 +118,37 @@ fi
 
 write_file() {
   local path="$1" mode="$2" owner="$3" group="$4" tmp
+  write_changed=0
   tmp="$(mktemp)"
   cat >"$tmp"
   if [[ ! -f "$path" ]] || ! cmp -s "$tmp" "$path"; then
     install -D -m "$mode" -o "$owner" -g "$group" "$tmp" "$path"
     echo "updated: $path"
+    write_changed=1
+  fi
+  rm -f "$tmp"
+}
+
+ensure_config_assignment() {
+  local path="$1" key="$2" value="$3" tmp mode
+  [[ -f "$path" && ! -L "$path" ]] || {
+    echo "WARN: cannot manage missing or symlinked config: $path"
+    return 0
+  }
+  tmp="$(mktemp)"
+  awk -v key="$key" -v value="$value" '
+    $0 ~ "^[#[:space:]]*" key "=" {
+      if (!seen) print key "=" value
+      seen=1
+      next
+    }
+    { print }
+    END { if (!seen) print key "=" value }
+  ' "$path" >"$tmp"
+  if ! cmp -s "$tmp" "$path"; then
+    mode="$(stat -c '%a' "$path")"
+    install -m "$mode" -o root -g root "$tmp" "$path"
+    echo "updated: $path $key=$value"
   fi
   rm -f "$tmp"
 }
@@ -276,6 +302,64 @@ run_as_desktop_user() {
   runuser -u "$RUN_USER" -- env USER_HOME="$USER_HOME" bash -s
 }
 
+ensure_hypr_key_latency_guard() {
+  run_as_desktop_user <<'EOF'
+set -euo pipefail
+path="$USER_HOME/.config/hypr/looknfeel.lua"
+[[ -f "$path" && ! -L "$path" ]] || {
+  echo "WARN: cannot apply keyboard latency guard to missing or symlinked file: $path"
+  exit 0
+}
+if grep -Fq 'local focus_border_is_visible = nil' "$path"; then
+  exit 0
+fi
+if ! grep -Fq 'hl.on("input.keyboard.key", handle_keyboard_input)' "$path"; then
+  echo "INFO: Omarchy looknfeel no longer has the per-key focus-border callback"
+  exit 0
+fi
+python3 - "$path" <<'PY'
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+old = """local function set_focus_border_visible(visible)
+  hl.config({"""
+new = """local focus_border_is_visible = nil
+
+local function set_focus_border_visible(visible)
+  if focus_border_is_visible == visible then
+    return
+  end
+  focus_border_is_visible = visible
+
+  hl.config({"""
+text = path.read_text()
+if text.count(old) != 1:
+    print(f"WARN: unexpected focus-border callback in {path}; latency guard not applied")
+    raise SystemExit(0)
+updated = text.replace(old, new, 1)
+backup = path.with_name(path.name + ".before-key-latency-guard")
+if not backup.exists():
+    shutil.copy2(path, backup)
+fd, temporary = tempfile.mkstemp(prefix=".looknfeel-latency-", dir=path.parent)
+try:
+    with os.fdopen(fd, "w") as stream:
+        stream.write(updated)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(temporary, path.stat().st_mode & 0o777)
+    os.replace(temporary, path)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+print(f"updated: {path} keyboard focus-border latency guard")
+PY
+EOF
+}
+
 is_known_legacy_artifact() {
   local path="$1" pattern
   [[ -f "$path" && ! -L "$path" ]] || return 1
@@ -427,7 +511,9 @@ fi
     $0 == "-- END Codex MacBookPro13,3 T1 graphics" { skip=0; next }
     skip { next }
     $0 == "-- Internal panel is wired to the Radeon GPU; avoid Intel/no-output scanout." { next }
+    $0 == "-- EFI routes the internal panel to Intel; keep the compositor off the Radeon." { next }
     $0 == "hl.env(\"AQ_DRM_DEVICES\", \"/dev/dri/radeon-dgpu\")" { next }
+    $0 == "hl.env(\"AQ_DRM_DEVICES\", \"/dev/dri/intel-igpu\")" { next }
     $0 == "-- Avoid modifier paths that can leave the internal eDP panel black on Aquamarine/AMDGPU." { next }
     $0 == "hl.env(\"AQ_NO_MODIFIERS\", \"1\")" { next }
     $0 == "hl.env(\"HYPRLAND_EGL_NO_MODIFIERS\", \"1\")" { next }
@@ -436,8 +522,8 @@ fi
   perl -0pi -e 's/\n+\z/\n/' "$tmp"
   {
     printf '%s\n' '-- BEGIN MacBookPro13,3 T1 graphics'
-    printf '%s\n' '-- Internal panel is wired to the Radeon GPU; avoid Intel/no-output scanout.'
-    printf '%s\n' 'hl.env("AQ_DRM_DEVICES", "/dev/dri/radeon-dgpu")'
+    printf '%s\n' '-- EFI routes the internal panel to Intel; keep the compositor off the Radeon.'
+    printf '%s\n' 'hl.env("AQ_DRM_DEVICES", "/dev/dri/intel-igpu")'
     printf '%s\n' '-- Avoid modifier paths that can leave the internal eDP panel black on Aquamarine/AMDGPU.'
     printf '%s\n' 'hl.env("AQ_NO_MODIFIERS", "1")'
     printf '%s\n' 'hl.env("HYPRLAND_EGL_NO_MODIFIERS", "1")'
@@ -448,6 +534,48 @@ fi
     echo "updated: $path MacBookPro13,3 graphics block"
   fi
   chmod 0644 "$path"
+EOF
+}
+
+ensure_hypr_trackpad_block() {
+  run_as_desktop_user <<'EOF'
+set -euo pipefail
+
+path="$USER_HOME/.config/hypr/input.lua"
+install -d -m 0755 "$(dirname "$path")"
+if [[ -L "$path" ]]; then
+  echo "WARN: refusing symlinked Hyprland input config: $path"
+  exit 0
+fi
+touch "$path"
+chmod 0644 "$path"
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+awk '
+  $0 == "-- BEGIN MacBookPro13,3 T1 trackpad" { skip=1; next }
+  $0 == "-- END MacBookPro13,3 T1 trackpad" { skip=0; next }
+  skip { next }
+  { print }
+' "$path" >"$tmp"
+perl -0pi -e 's/\n+\z/\n/' "$tmp"
+cat >>"$tmp" <<'LUA'
+-- BEGIN MacBookPro13,3 T1 trackpad
+-- Keep palm contact from grabbing and dragging windows while typing.
+hl.config({
+  input = {
+    touchpad = {
+      disable_while_typing = true,
+      tap_and_drag = false,
+    },
+  },
+})
+-- END MacBookPro13,3 T1 trackpad
+LUA
+if ! cmp -s "$tmp" "$path"; then
+  cp "$tmp" "$path"
+  echo "updated: $path MacBookPro13,3 trackpad block"
+fi
+chmod 0644 "$path"
 EOF
 }
 
@@ -491,6 +619,11 @@ EOF
 }
 
 cleanup_legacy_artifacts
+
+# Keep the recovery menu useful without presenting every historical snapshot.
+# The ordinary Arch kernel was removed; exclude its stale snapshot entries.
+ensure_config_assignment /etc/limine-snapper-sync.conf MAX_SNAPSHOT_ENTRIES 2
+ensure_config_assignment /etc/limine-snapper-sync.conf EXCLUDE_SNAPSHOT_ENTRIES '"linux, linux-omarchy"'
 
 write_file /usr/local/sbin/macbook-t1-limine-unattended-fix 0755 root root <<'EOF'
 #!/usr/bin/env bash
@@ -549,26 +682,114 @@ WantedBy=multi-user.target
 EOF
 
 write_file /etc/limine-entry-tool.d/macbook13-stability.conf 0644 root root <<'EOF'
-# MacBookPro13,3 stability: preserve Radeon rescue flags through Omarchy-generated Limine/UKI updates.
-KERNEL_CMDLINE[default]+=" amdgpu.runpm=0 amdgpu.aspm=0 amdgpu.bapm=0 radeon.runpm=0 pcie_aspm=off"
+# The integrated GPU owns the internal panel.  Keeping amdgpu out of normal
+# boots avoids the Polaris reset callback that hangs S3 resume on this model.
+# This machine exposes the internal PCH codec first and the unused Radeon HDMI
+# codec second; do not let the latter bind and retain Radeon power during sleep.
+# Deep sleep strands both Alpine Ridge USB controllers, so make s2idle the safe
+# kernel default as well as the systemd sleep policy.
+# Leave PCIe services native so Alpine Ridge can run its full resume path.
+# The hand-written Safe Graphics and Console entries remain Radeon-capable.
+KERNEL_CMDLINE[default]+=" module_blacklist=amdgpu snd_hda_intel.enable=1,0 mem_sleep_default=s2idle"
 EOF
 
-write_file /etc/systemd/system/macbook-t1-radeon-d3cold.service 0644 root root <<'EOF'
+write_file /etc/mkinitcpio.conf.d/zz-macbook-t1-early-kms.conf 0644 root root <<'EOF'
+# Load the Intel display driver before Plymouth.  The Radeon is deliberately
+# kept out of the normal boot because its S3 noirq reset hangs this model.
+MODULES+=(i915)
+EOF
+if (( write_changed )); then
+  mark_uki_rebuild_pending "switched early graphics from Radeon to Intel"
+fi
+
+# Hibernation image restore resets this T1 MacBook before userspace on both
+# supported kernels.  Keep the stock mkinitcpio resume hook for normal boot
+# compatibility, but remove the one-off diagnostic hook used during analysis.
+removed_resume_artifact=0
+for resume_artifact in \
+  /etc/initcpio/hooks/macbook-t1-resume \
+  /etc/initcpio/install/macbook-t1-resume \
+  /etc/mkinitcpio.conf.d/zz-macbook-t1-resume.conf; do
+  if [[ -e "$resume_artifact" || -L "$resume_artifact" ]]; then
+    rm -f -- "$resume_artifact"
+    echo "removed: $resume_artifact"
+    removed_resume_artifact=1
+  fi
+done
+if (( removed_resume_artifact )); then
+  mark_uki_rebuild_pending "removed diagnostic hibernation resume hook"
+fi
+
+write_file /usr/local/sbin/macbook-t1-radeon-off 0755 root root <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $EUID == 0 ]] || exit 1
+[[ $(cat /sys/class/dmi/id/product_name) == MacBookPro13,3 ]] || exit 0
+desktop_user=$(awk -F= '$1 == "OMARCHY_USER" { print $2; exit }' /etc/macbook-t1-omarchy.conf 2>/dev/null || true)
+[[ -n $desktop_user ]] || desktop_user=$(getent passwd 1000 | cut -d: -f1)
+desktop_home=$(getent passwd "$desktop_user" | cut -d: -f6)
+config=$desktop_home/.config/hypr/hyprland.lua
+gmux=/sys/kernel/debug/apple_gmux
+intel_panel_connected() {
+  local connector card device name
+  for connector in /sys/class/drm/card*-eDP-*/status /sys/class/drm/card*-LVDS-*/status; do
+    [[ -e $connector ]] || continue
+    name=$(basename "${connector%/status}")
+    card=/sys/class/drm/${name%%-*}
+    device=$(basename "$(readlink -f "$card/device")")
+    [[ $device == 0000:00:02.0 ]] || continue
+    [[ $(cat "$connector") == connected ]] && return 0
+  done
+  return 1
+}
+for _ in $(seq 1 60); do
+  if intel_panel_connected && pgrep -x Hyprland >/dev/null; then break; fi
+  sleep 1
+done
+intel_panel_connected || { echo 'Intel does not own a connected internal panel' >&2; exit 1; }
+grep -Fq 'hl.env("AQ_DRM_DEVICES", "/dev/dri/intel-igpu")' "$config" || {
+  echo 'Hyprland is not pinned to Intel' >&2; exit 1;
+}
+if [[ -e /sys/bus/pci/devices/0000:01:00.0/driver ]] || [[ -d /sys/module/amdgpu ]]; then
+  echo 'amdgpu is bound or loaded; refusing to cut Radeon power' >&2
+  exit 1
+fi
+
+# The HDMI function can bind independently even though amdgpu is blacklisted.
+# The managed kernel command line disables its second snd_hda_intel instance
+# before userspace can open it. Never unbind it here: snd_card_free can block
+# indefinitely once PipeWire has observed the card.
+radeon_audio=/sys/bus/pci/devices/0000:01:00.1
+[[ ! -e $radeon_audio/driver ]] || {
+  echo 'Radeon HDMI audio is bound; refusing to cut Radeon power (check snd_hda_intel.enable=1,0)' >&2
+  exit 1
+}
+[[ -w $gmux/selected_port && -w $gmux/selected_port_data ]] || exit 1
+echo 0x50 >"$gmux/selected_port"
+printf '\001' >"$gmux/selected_port_data"
+printf '\000' >"$gmux/selected_port_data"
+EOF
+
+write_file /etc/systemd/system/macbook-t1-radeon-off.service 0644 root root <<'EOF'
 [Unit]
-Description=Keep MacBookPro13,3 Radeon dGPU out of D3cold
-DefaultDependencies=no
-After=sysinit.target
-Before=display-manager.service multi-user.target
-ConditionPathExists=/sys/bus/pci/devices/0000:01:00.0
+Description=Power down inactive MacBook Radeon after Intel desktop starts
+After=display-manager.service
+Before=sleep.target
+ConditionPathExists=/sys/kernel/debug/apple_gmux/selected_port_data
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c '[ -w /sys/bus/pci/devices/0000:01:00.0/d3cold_allowed ] && echo 0 > /sys/bus/pci/devices/0000:01:00.0/d3cold_allowed; [ -w /sys/bus/pci/devices/0000:01:00.0/power/control ] && echo on > /sys/bus/pci/devices/0000:01:00.0/power/control; exit 0'
+ExecStart=/usr/local/sbin/macbook-t1-radeon-off
+TimeoutStartSec=75s
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target
 EOF
+
+systemctl disable --now macbook-t1-radeon-d3cold.service >/dev/null 2>&1 || true
+rm -rf /etc/systemd/system/macbook-t1-radeon-d3cold.service.d
+rm -f /etc/systemd/system/macbook-t1-radeon-d3cold.service
 
 write_file /usr/local/sbin/macbook-t1-dri-symlinks 0755 root root <<'EOF'
 #!/usr/bin/env sh
@@ -578,13 +799,8 @@ for _ in $(seq 1 80); do
   for card in /sys/bus/pci/devices/0000:00:02.0/drm/card[0-9]*; do
     [ -e "$card" ] || continue
     node=${card##*/}
-    [ -e "/dev/dri/$node" ] && ln -sfn "$node" /dev/dri/intel-igpu
-  done
-  for card in /sys/bus/pci/devices/0000:01:00.0/drm/card[0-9]*; do
-    [ -e "$card" ] || continue
-    node=${card##*/}
     if [ -e "/dev/dri/$node" ]; then
-      ln -sfn "$node" /dev/dri/radeon-dgpu
+      ln -sfn "$node" /dev/dri/intel-igpu
       exit 0
     fi
   done
@@ -597,7 +813,7 @@ write_file /etc/systemd/system/macbook-t1-dri-symlinks.service 0644 root root <<
 [Unit]
 Description=Create stable MacBookPro13,3 DRI symlinks before the display manager
 DefaultDependencies=no
-After=systemd-udevd.service systemd-udev-trigger.service macbook-t1-radeon-d3cold.service
+After=systemd-udevd.service systemd-udev-trigger.service
 Before=display-manager.service
 
 [Service]
@@ -617,7 +833,7 @@ EOF
 write_file /etc/systemd/system/sddm.service.d/20-macbook-t1-dri-ordering.conf 0644 root root <<'EOF'
 [Unit]
 Wants=macbook-t1-dri-symlinks.service rtkit-daemon.service
-After=macbook-t1-dri-symlinks.service macbook-t1-radeon-d3cold.service rtkit-daemon.service
+After=macbook-t1-dri-symlinks.service rtkit-daemon.service
 EOF
 
 if [[ "$enable_autologin" == 1 ]]; then
@@ -680,6 +896,11 @@ Operation = Upgrade
 Type = Package
 Target = linux
 Target = linux-headers
+Target = linux-lts
+Target = linux-lts-headers
+Target = linux-omarchy
+Target = linux-omarchy-headers
+Target = t1-touchbar-dkms
 Target = linux-firmware
 Target = linux-firmware-broadcom
 Target = networkmanager
@@ -687,11 +908,17 @@ Target = wireless-regdb
 Target = dkms
 Target = limine
 Target = limine-mkinitcpio-hook
+Target = limine-snapper-sync
+Target = snapper
 Target = omarchy
+Target = systemd
 Target = sddm
 Target = hyprland
 Target = aquamarine
 Target = rtkit
+Target = pipewire
+Target = wireplumber
+Target = libinput
 
 [Action]
 Description = Reapplying MacBookPro13,3 T1 Omarchy survival fixes...
@@ -701,6 +928,10 @@ NeedsTargets
 EOF
 
 ensure_omarchy_post_update_hook
+
+if [[ -x /usr/local/sbin/macbook-t1-touchbar-resume-fix ]]; then
+  /usr/local/sbin/macbook-t1-touchbar-resume-fix
+fi
 
 if [[ "$preserve_luks_auto_unlock" == 1 && -f /crypto_keyfile.bin ]]; then
   chmod 000 /crypto_keyfile.bin
@@ -729,6 +960,17 @@ else
 fi
 
 ensure_hypr_graphics_block
+ensure_hypr_trackpad_block
+ensure_hypr_key_latency_guard
+
+if [[ -x /usr/local/sbin/macbook-t1-gpu-pref ]]; then
+  gpu_status=$(/usr/local/sbin/macbook-t1-gpu-pref status)
+  if ! grep -q '^efi-preference=integrated$' <<<"$gpu_status"; then
+    install -d -m 0700 "$state_dir/efi-gpu"
+    touch "$state_dir/efi-gpu/igd-boot-pending"
+    /usr/local/sbin/macbook-t1-gpu-pref integrated
+  fi
+fi
 
 if command -v dkms >/dev/null 2>&1; then
   dkms autoinstall || echo "WARN: dkms autoinstall failed"
@@ -739,6 +981,15 @@ if command -v dkms >/dev/null 2>&1; then
   fi
   if ! grep -q '^apple-ib-drv/0[.]1,' <<<"$dkms_out"; then
     echo "WARN: apple-ib-drv/0.1 is not registered in DKMS"
+  fi
+  if ! grep -q '^macbook-t1-ec-wake/0[.]1,' <<<"$dkms_out"; then
+    echo "WARN: macbook-t1-ec-wake/0.1 is not registered in DKMS"
+  fi
+  if ! grep -q '^macbook-t1-socw/0[.]1,' <<<"$dkms_out"; then
+    echo "WARN: macbook-t1-socw/0.1 is not registered in DKMS (Touch Bar stays dark after S3)"
+  fi
+  if ! grep -q '^macbook-t1-tb-nod3/0[.]1,' <<<"$dkms_out"; then
+    echo "WARN: macbook-t1-tb-nod3/0.1 is not registered in DKMS (s2idle resume takes ~20 s)"
   fi
 else
   echo "WARN: dkms not installed"
@@ -767,7 +1018,8 @@ systemctl enable sddm.service >/dev/null 2>&1 || true
 systemctl enable rtkit-daemon.service >/dev/null 2>&1 || true
 systemctl enable fstrim.timer >/dev/null 2>&1 || true
 systemctl enable t1-touchbar.service >/dev/null 2>&1 || true
-systemctl enable macbook-t1-radeon-d3cold.service >/dev/null 2>&1 || true
+systemctl enable macbook-t1-igd-boot-check.service >/dev/null 2>&1 || true
+systemctl enable macbook-t1-radeon-off.service >/dev/null 2>&1 || true
 systemctl enable macbook-t1-dri-symlinks.service >/dev/null 2>&1 || true
 systemctl enable --now macbook-t1-limine-unattended-fix.path >/dev/null 2>&1 || true
 
@@ -776,7 +1028,7 @@ if (( changed_initramfs )) || [[ -f "$pending_uki_rebuild" ]]; then
     echo "FAIL: UKI rebuild is pending, but limine-mkinitcpio is unavailable"
     exit 1
   fi
-  echo "rebuilding UKI because mkinitcpio keyfile config changed"
+  echo "rebuilding UKI because managed mkinitcpio configuration changed"
   if ! limine-mkinitcpio; then
     echo "FAIL: limine-mkinitcpio failed; pending rebuild marker preserved at $pending_uki_rebuild"
     exit 1

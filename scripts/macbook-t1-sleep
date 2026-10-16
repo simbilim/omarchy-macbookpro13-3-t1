@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+# Managed by the MacBook T1 mobile profile. Called by systemd-suspend.service.
+set -euo pipefail
+[[ $EUID == 0 ]]
+[[ $(cat /sys/class/dmi/id/product_name) == MacBookPro13,3 ]]
+state=/run/macbook-t1-sleep
+spi_wakeup=/sys/bus/spi/devices/spi-APP000D:00/power/wakeup
+spi_gpe=/sys/firmware/acpi/interrupts/gpe17
+audio_card=alsa_card.pci-0000_00_1f.3
+audio_units=(
+  wireplumber.service
+  pipewire-pulse.socket
+  pipewire.socket
+  pipewire-pulse.service
+  pipewire.service
+)
+
+user_audio_ctl() {
+  local uid=$1 passwd user
+  shift
+  passwd=$(getent passwd "$uid") || return 1
+  user=${passwd%%:*}
+  [[ -n $user && -d /run/user/$uid ]] || return 1
+  runuser -u "$user" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+    systemctl --user "$@"
+}
+
+restore_user_audio() {
+  local saved uid unit profile rc=0
+  local -a units
+  for saved in "$state"/audio-profile-*; do
+    [[ -f $saved ]] || continue
+    uid=${saved##*/audio-profile-}
+    [[ $uid =~ ^[0-9]+$ ]] || { rc=1; continue; }
+    read -r profile < "$saved"
+    if user_pactl "$uid" set-card-profile "$audio_card" "$profile"; then
+      rm -f -- "$saved"
+    else
+      rc=1
+    fi
+  done
+  # Older helper versions stopped the PipeWire units instead; restart any
+  # still recorded.
+  for saved in "$state"/audio-active-*; do
+    [[ -f $saved ]] || continue
+    uid=${saved##*/audio-active-}
+    [[ $uid =~ ^[0-9]+$ ]] || { rc=1; continue; }
+    mapfile -t units < "$saved"
+    ((${#units[@]} > 0)) || { rc=1; continue; }
+    for unit in "${units[@]}"; do
+      [[ " ${audio_units[*]} " == *" $unit "* ]] || { rc=1; continue 2; }
+    done
+    if user_audio_ctl "$uid" start "${units[@]}"; then
+      rm -f -- "$saved"
+    else
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+wake_user_displays() {
+  [[ -x /usr/bin/omarchy-system-wake ]] || return 0
+  local runtime uid passwd user home session_dump line
+  local -a session_env
+  for runtime in /run/user/[0-9]*; do
+    [[ -S $runtime/bus ]] || continue
+    uid=${runtime##*/}
+    [[ $uid =~ ^[0-9]+$ && $uid -ge 1000 ]] || continue
+    passwd=$(getent passwd "$uid") || continue
+    user=${passwd%%:*}
+    home=$(cut -d: -f6 <<<"$passwd")
+    [[ -n $user && -d $home ]] || continue
+    session_dump=$(user_audio_ctl "$uid" show-environment) || continue
+    session_env=()
+    while IFS= read -r line; do
+      case $line in
+        HYPRLAND_INSTANCE_SIGNATURE=*|WAYLAND_DISPLAY=*|OMARCHY_PATH=*)
+          session_env+=("$line")
+          ;;
+      esac
+    done <<<"$session_dump"
+    ((${#session_env[@]} > 0)) || continue
+    if runuser -u "$user" -- env \
+      HOME="$home" XDG_RUNTIME_DIR="$runtime" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" \
+      "${session_env[@]}" timeout --kill-after=1s 5s \
+      /usr/bin/omarchy-system-wake; then
+      echo "Woke Omarchy displays after resume for user $user"
+    else
+      echo "WARN: could not wake Omarchy displays after resume for user $user" >&2
+    fi
+  done
+}
+
+cs8409_streams_closed() {
+  local codec card status first second stream_state rc=0
+  for codec in /proc/asound/card*/codec#*; do
+    [[ -r $codec ]] || continue
+    grep -q '^Codec: Cirrus Logic CS8409' "$codec" || continue
+    card=${codec%/*}
+    for status in "$card"/pcm*/sub*/status; do
+      [[ -r $status ]] || continue
+      read -r first second < "$status"
+      stream_state=${second:-$first}
+      if [[ ${stream_state,,} != closed ]]; then
+        echo "Refusing closed-lid sleep with active CS8409 stream: $status=$stream_state" >&2
+        rc=1
+      fi
+    done
+  done
+  return "$rc"
+}
+
+# Run pactl in a user's PipeWire session.
+user_pactl() {
+  local uid=$1 passwd user
+  shift
+  passwd=$(getent passwd "$uid") || return 1
+  user=${passwd%%:*}
+  [[ -n $user && -S /run/user/$uid/pulse/native ]] || return 1
+  runuser -u "$user" -- env XDG_RUNTIME_DIR="/run/user/$uid" pactl "$@"
+}
+
+# Switching the built-in card to the "off" profile closes every CS8409 PCM,
+# which runs the codec's speaker-amplifier shutdown, while applications keep
+# their PipeWire connections. Stopping PipeWire instead made browsers lose
+# their microphone and speakers until restarted (Teams: "no mic found").
+quiesce_user_audio() {
+  local runtime uid profile
+  for runtime in /run/user/[0-9]*; do
+    [[ -d $runtime ]] || continue
+    uid=${runtime##*/}
+    [[ $uid =~ ^[0-9]+$ && $uid -ge 1000 ]] || continue
+    profile=$(user_pactl "$uid" list cards 2>/dev/null |
+      awk -v card="$audio_card" '$1 == "Name:" { f = ($2 == card) } f && /Active Profile:/ { print $3; exit }') || continue
+    [[ -n $profile && $profile != off ]] || continue
+    printf '%s\n' "$profile" > "$state/audio-profile-$uid"
+    user_pactl "$uid" set-card-profile "$audio_card" off
+  done
+  # PipeWire closes the PCMs asynchronously; with an active call this can
+  # take longer than half a second.
+  local tries
+  for tries in {1..25}; do
+    cs8409_streams_closed 2>/dev/null && break
+    sleep 0.2
+  done
+  cs8409_streams_closed
+  echo 'Quiesced user audio and closed CS8409 streams before closed-lid suspend'
+}
+
+# Built-in Alpine Ridge upstream bridges sit directly below the PEG1/PEG2 root
+# ports; bridges inside external docks do not.
+alpine_ridge_upstream_bridges() {
+  local dev
+  for dev in /sys/bus/pci/devices/0000:00:01.[12]/0000:*; do
+    [[ -e $dev/vendor ]] || continue
+    [[ $(<"$dev/vendor") == 0x8086 && $(<"$dev/device") == 0x1578 ]] || continue
+    echo "$dev"
+  done
+}
+
+usb_c_devices_attached() {
+  local hub xhci device
+  for hub in /sys/bus/usb/devices/usb*; do
+    xhci=$(readlink -f "$hub/..")
+    [[ -r $xhci/device && $(<"$xhci/device") == 0x15d4 ]] || continue
+    # Devices are named like 3-1 or 3-1.2; 3-0:1.0 is the root hub interface.
+    for device in "$hub"/[0-9]*-[0-9]*; do
+      [[ -e $device && ${device##*/} != *:* ]] && return 0
+    done
+  done
+  return 1
+}
+
+remove_alpine_ridge_trees() {
+  local bridge source real count=0
+  local -a bridges
+  mapfile -t bridges < <(alpine_ridge_upstream_bridges)
+  ((${#bridges[@]} > 0)) || return 0
+  # Removing a controller under a mounted filesystem would lose data.
+  while read -r source; do
+    [[ $source == /dev/* ]] || continue
+    real=$(readlink -f "/sys/class/block/$(basename "$source")" 2>/dev/null) || continue
+    for bridge in "${bridges[@]}"; do
+      if [[ $real == "$(readlink -f "$bridge")"/* ]]; then
+        echo "Refusing S3 while $source is mounted behind a USB-C controller" >&2
+        return 1
+      fi
+    done
+  done < <(findmnt -rn -o SOURCE)
+  for bridge in "${bridges[@]}"; do
+    echo 1 > "$bridge/remove"
+    count=$((count + 1))
+  done
+  echo "$count" > "$state/alpine_ridge_removed"
+  echo "Removed $count Alpine Ridge PCIe trees before S3"
+}
+
+restore() {
+  [[ -d $state ]] || return 0
+  local rc=0 value saved device
+  for saved in "$state"/xhci-wakeup-*; do
+    [[ -f $saved ]] || continue
+    device=${saved##*/xhci-wakeup-}
+    [[ $device =~ ^0000:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]] || { rc=1; continue; }
+    read -r value < "$saved"
+    [[ $value == enabled || $value == disabled ]] || { rc=1; continue; }
+    [[ -w /sys/bus/pci/devices/$device/power/wakeup ]] || { rc=1; continue; }
+    echo "$value" > "/sys/bus/pci/devices/$device/power/wakeup" || rc=1
+  done
+  if [[ -f $state/spi-wakeup ]]; then
+    read -r value < "$state/spi-wakeup"
+    [[ $value == enabled || $value == disabled ]] || rc=1
+    if [[ -w $spi_wakeup ]]; then
+      echo "$value" > "$spi_wakeup" || rc=1
+    else
+      rc=1
+    fi
+  fi
+  if [[ -f $state/gpe17-mask ]]; then
+    read -r value < "$state/gpe17-mask"
+    [[ $value == masked || $value == unmasked ]] || rc=1
+    if [[ -r $spi_gpe && -w $spi_gpe ]]; then
+      current=$(awk '{print $NF}' "$spi_gpe")
+      if [[ $current != "$value" ]]; then
+        case $value in
+          masked) printf 'mask\n' > "$spi_gpe" || rc=1 ;;
+          unmasked) printf 'unmask\n' > "$spi_gpe" || rc=1 ;;
+        esac
+      fi
+    else
+      rc=1
+    fi
+  fi
+  if [[ -f $state/pm_async ]]; then
+    read -r value < "$state/pm_async"
+    [[ $value =~ ^[01]$ ]] && echo "$value" > /sys/power/pm_async || rc=1
+  fi
+  if [[ -f $state/alpine_ridge_removed ]]; then
+    echo 1 > /sys/bus/pci/rescan || rc=1
+    # After the rescan the Alpine Ridge xHCIs miss hot-plug events while
+    # runtime-suspended, so keep them in D0 until the next S3 removes them.
+    for device in /sys/bus/pci/devices/*; do
+      [[ $(<"$device/vendor") == 0x8086 && $(<"$device/device") == 0x15d4 ]] || continue
+      echo on > "$device/power/control" || rc=1
+    done
+    if [[ $(alpine_ridge_upstream_bridges | wc -l) -ne $(cat "$state/alpine_ridge_removed") ]]; then
+      echo 'WARN: Alpine Ridge trees did not return after PCI rescan' >&2
+      rc=1
+    fi
+  fi
+  if [[ -f $state/brcmfmac_removed ]]; then
+    modprobe brcmfmac || rc=1
+  fi
+  if [[ -f $state/thunderbolt_removed ]]; then
+    read -r value < "$state/host_reset"
+    [[ $value =~ ^[YN01]$ ]] && modprobe thunderbolt "host_reset=$value" || rc=1
+  fi
+  restore_user_audio || rc=1
+  if (( rc == 0 )); then rm -rf -- "$state"; fi
+  return "$rc"
+}
+
+case ${1:-} in
+  pre)
+    # Recover a previous failed preparation before starting a new transaction.
+    restore
+    install -d -m 0700 "$state"
+    trap 'restore' ERR
+    modprobe macbook_t1_ec_wake
+    [[ -d /sys/module/macbook_t1_ec_wake ]]
+    for device in /sys/bus/thunderbolt/devices/*-*; do
+      [[ -e $device ]] || continue
+      if [[ ! ${device##*/} =~ ^[0-9]+-0$ ]]; then
+        echo 'Refusing sleep while an external Thunderbolt device is attached' >&2
+        restore
+        exit 1
+      fi
+    done
+    # Select the sleep mode here, so the preparation below matches the state
+    # the kernel actually enters. s2idle on this model never leaves package C3 and draws
+    # 8-12 W; S3 measured about 0.1-0.2 W.
+    # The sleep drop-in leaves MemorySleepMode unset, so systemd does not
+    # override this choice. OMARCHY_SLEEP_MODE=s2idle restores the old mode.
+    mode=$(awk -F= '$1 == "OMARCHY_SLEEP_MODE" { print $2; exit }' /etc/macbook-t1-omarchy.conf 2>/dev/null || true)
+    [[ $mode == deep || $mode == s2idle ]] || mode=deep
+    # With a device attached to a USB-C port during S3, firmware leaves that
+    # controller unpowered until a cold boot; even Apple's UPSB._PS0 power-on
+    # path cannot recover it. Use s2idle for such a cycle instead.
+    if [[ $mode == deep ]] && usb_c_devices_attached; then
+      echo 'USB-C device attached; using s2idle for this sleep cycle'
+      mode=s2idle
+    fi
+    if grep -qw "$mode" /sys/power/mem_sleep; then
+      echo "$mode" > /sys/power/mem_sleep
+    fi
+    # Both modes need serial callbacks and the unused NHI driver removed. In
+    # s2idle, leaving the NHI bound lets Apple firmware power down both Alpine
+    # Ridge trees, which makes their USB controllers inaccessible on resume.
+    cat /sys/power/pm_async > "$state/pm_async"
+    echo 0 > /sys/power/pm_async
+    if [[ -d /sys/module/thunderbolt ]]; then
+      cat /sys/module/thunderbolt/parameters/host_reset > "$state/host_reset"
+      modprobe -r thunderbolt
+      touch "$state/thunderbolt_removed"
+    fi
+    # In S3 the firmware cuts power to both Alpine Ridge controllers and does
+    # not restore it. Resuming devices that are still enumerated stalls about
+    # 70 s per controller and loses them. Remove both trees before S3 and
+    # rescan after wake; the firmware has powered them again by then.
+    if grep -q '\[deep\]' /sys/power/mem_sleep; then
+      remove_alpine_ridge_trees
+    fi
+    # BCM43602 firmware state does not survive sleep reliably, in S3 and in
+    # s2idle: afterwards the radio may report a hardware block, or the access
+    # point rejects every association with status 16. A fresh driver load
+    # after wake avoids this. rmmod rather than modprobe -r, which would also
+    # unload cfg80211.
+    if [[ -d /sys/module/brcmfmac ]]; then
+      [[ -d /sys/module/brcmfmac_wcc ]] && rmmod brcmfmac_wcc
+      rmmod brcmfmac
+      touch "$state/brcmfmac_removed"
+    fi
+    # Closed-lid traces on this model identified xHCI and Apple SPI wake events
+    # as sources of premature or power-hungry s2idle cycles.  Preserve and
+    # disable both only for a lid cycle.  The EC GPE remains the lid-open wake
+    # path; the keyboard/touchpad state is restored immediately after resume.
+    if [[ -r /proc/acpi/button/lid/LID0/state ]] &&
+       grep -q 'closed' /proc/acpi/button/lid/LID0/state; then
+      # The out-of-tree CS8409 codec driver has a no-op suspend callback.
+      # Closing active PipeWire streams invokes its working playback cleanup,
+      # which powers down the external speaker amplifiers before s2idle.
+      quiesce_user_audio
+      for device in 0000:00:14.0 0000:07:00.0 0000:7d:00.0; do
+        wakeup=/sys/bus/pci/devices/$device/power/wakeup
+        [[ -r $wakeup && -w $wakeup ]] || continue
+        cat "$wakeup" > "$state/xhci-wakeup-$device"
+        echo disabled > "$wakeup"
+      done
+      if [[ -r $spi_wakeup && -w $spi_wakeup ]]; then
+        cat "$spi_wakeup" > "$state/spi-wakeup"
+        echo disabled > "$spi_wakeup"
+      fi
+      if [[ -r $spi_gpe && -w $spi_gpe ]]; then
+        gpe_mask=$(awk '{print $NF}' "$spi_gpe")
+        [[ $gpe_mask == masked || $gpe_mask == unmasked ]]
+        printf '%s\n' "$gpe_mask" > "$state/gpe17-mask"
+        if [[ $gpe_mask == unmasked ]]; then
+          printf 'mask\n' > "$spi_gpe"
+        fi
+        [[ $(awk '{print $NF}' "$spi_gpe") == masked ]]
+      fi
+    fi
+    echo 'Prepared MacBook T1 suspend: EC lid wake enabled; closed-lid audio quiesced and xHCI/Apple SPI GPE wake suppressed'
+    ;;
+  post)
+    # Light the panel first: the restore below (PCI rescan, Wi-Fi and
+    # Thunderbolt reloads, audio) takes about 1.5 s and the user is waiting.
+    wake_user_displays
+    # Finish the remaining wake steps even if part of the restore failed.
+    post_rc=0
+    restore || post_rc=$?
+    if [[ -x /usr/local/sbin/macbook-t1-radeon-off ]]; then
+      /usr/local/sbin/macbook-t1-radeon-off
+    fi
+    echo 'Restored MacBook T1 callback scheduling, Thunderbolt NHI, user audio, xHCI and Apple SPI/GPE wake policy'
+    exit "$post_rc"
+    ;;
+  *) echo 'Usage: macbook-t1-sleep pre|post' >&2; exit 2 ;;
+esac

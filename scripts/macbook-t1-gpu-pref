@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Read or change the Apple EFI startup GPU preference on MacBookPro13,3.
+set -euo pipefail
+
+[[ $EUID == 0 ]] || { echo 'Run as root' >&2; exit 1; }
+[[ $(cat /sys/class/dmi/id/product_name) == MacBookPro13,3 ]] || {
+  echo 'This helper is restricted to MacBookPro13,3' >&2
+  exit 1
+}
+
+name=fa4ce28d-b62f-4c99-9cc3-6815686e30f9-gpu-power-prefs
+path=/sys/firmware/efi/efivars/gpu-power-prefs-fa4ce28d-b62f-4c99-9cc3-6815686e30f9
+state_dir=/var/lib/macbook-t1-omarchy/efi-gpu
+tmp=
+cleanup() {
+  [[ -z ${tmp:-} ]] || rm -f "$tmp"
+}
+trap cleanup EXIT
+
+read_pref() {
+  [[ -r $path ]] || { echo missing; return; }
+  local value
+  value=$(od -An -j4 -N4 -tx1 -v "$path" | tr -d ' \n')
+  case $value in
+    01000000) echo integrated ;;
+    00000000) echo discrete ;;
+    *) echo "unknown:$value" ;;
+  esac
+}
+
+show_status() {
+  printf 'efi-preference=%s\n' "$(read_pref)"
+  if [[ -r /sys/kernel/debug/vgaswitcheroo/switch ]]; then
+    cat /sys/kernel/debug/vgaswitcheroo/switch
+  fi
+}
+
+write_pref() {
+  local mode=$1 value=$2 backup tmp
+  command -v efivar >/dev/null || { echo 'efivar is required' >&2; exit 1; }
+  mountpoint -q /sys/firmware/efi/efivars || { echo 'efivarfs is not mounted' >&2; exit 1; }
+  install -d -m 0700 "$state_dir"
+  backup="$state_dir/gpu-power-prefs-$(date +%Y%m%d-%H%M%S).efivar"
+  efivar -n "$name" -e "$backup"
+  tmp=$(mktemp "$state_dir/payload.XXXXXX")
+  printf '%b' "$value" >"$tmp"
+  efivar -n "$name" -f "$tmp" -w
+  if [[ $(read_pref) != "$mode" ]]; then
+    echo "EFI preference verification failed; backup: $backup" >&2
+    exit 1
+  fi
+  echo "efi-preference=$mode"
+  echo "backup=$backup"
+}
+
+case ${1:-status} in
+  status) show_status ;;
+  integrated) write_pref integrated '\x01\x00\x00\x00' ;;
+  discrete) write_pref discrete '\x00\x00\x00\x00' ;;
+  *) echo "Usage: $0 {status|integrated|discrete}" >&2; exit 2 ;;
+esac

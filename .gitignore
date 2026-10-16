@@ -39,3 +39,5 @@ brcmfmac43602-pcie*.txt
 secrets/
 private/
 captures/
+__pycache__/
+*.pyc

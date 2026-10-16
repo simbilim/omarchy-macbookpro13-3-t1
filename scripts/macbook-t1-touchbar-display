@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Follow the internal panel's DPMS state using the existing Touch Bar control."""
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import time
+
+
+STATE = Path('/run/macbook-t1-touchbar-display/previous-idle.json')
+HID = Path('/sys/bus/hid/devices')
+DEVICE_NAME = re.compile(r'[0-9A-Fa-f]{4}:[0-9A-Fa-f]{4}:[0-9A-Fa-f]{4}\.[0-9A-Fa-f]+')
+stopping = False
+
+
+def request_stop(_signum, _frame):
+    global stopping
+    stopping = True
+
+
+def controls():
+    return {
+        p.parent.name: p for p in HID.glob('*/idle_timeout')
+        if (p.parent / 'driver').resolve().name == 'apple-touchbar'
+    }
+
+
+def panel_on():
+    states = [p.read_text().strip() for p in Path('/sys/class/drm').glob('card*-eDP-*/dpms')]
+    if not states or any(value not in {'On', 'Off', 'Standby', 'Suspend'} for value in states):
+        return None
+    return any(value == 'On' for value in states)
+
+
+def save(previous):
+    temporary = STATE.with_suffix('.tmp')
+    temporary.write_text(json.dumps(previous) + '\n')
+    temporary.replace(STATE)
+
+
+def restore(previous, available):
+    for name, value in list(previous.items()):
+        path = available.get(name)
+        # Preserve a setting changed by the user while this service owned it.
+        if path is not None and int(path.read_text()) == -2:
+            path.write_text(str(value) + '\n')
+            print('Touch Bar: restored screen-on policy', flush=True)
+        del previous[name]
+        save(previous)
+
+
+def main():
+    if os.geteuid() != 0 or Path('/sys/class/dmi/id/product_name').read_text().strip() != 'MacBookPro13,3':
+        raise SystemExit('This service requires root on MacBookPro13,3')
+    previous = json.loads(STATE.read_text()) if STATE.exists() else {}
+    if not isinstance(previous, dict) or any(
+        not DEVICE_NAME.fullmatch(name) or type(value) is not int or not -1 <= value <= 2147483647
+        for name, value in previous.items()
+    ):
+        raise SystemExit('Invalid saved Touch Bar policy; refusing to overwrite it')
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    last_error = None
+    try:
+        while not stopping:
+            try:
+                available = controls()
+                if panel_on() is False:
+                    for name, path in available.items():
+                        value = int(path.read_text())
+                        if value != -2:
+                            # Record the previous policy before disabling the strip.
+                            previous[name] = value
+                            save(previous)
+                            path.write_text('-2\n')
+                            print('Touch Bar: inactive while the internal screen is off', flush=True)
+                    for name in set(previous) - set(available):
+                        del previous[name]
+                        save(previous)
+                else:
+                    # Unknown panel state also releases any setting we own.
+                    restore(previous, available)
+                last_error = None
+            except OSError as error:
+                if str(error) != last_error:
+                    print('Touch Bar state retry: ' + str(error), flush=True)
+                    last_error = str(error)
+            time.sleep(1)
+    finally:
+        restore(previous, controls())
+
+
+if __name__ == '__main__':
+    main()

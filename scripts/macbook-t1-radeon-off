@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Cut power to the unused Radeon after an EFI-selected Intel desktop starts.
+set -euo pipefail
+
+[[ $EUID == 0 ]] || { echo 'Run as root' >&2; exit 1; }
+[[ $(cat /sys/class/dmi/id/product_name) == MacBookPro13,3 ]] || exit 0
+
+desktop_user=$(awk -F= '$1 == "OMARCHY_USER" { print $2; exit }' /etc/macbook-t1-omarchy.conf 2>/dev/null || true)
+[[ -n $desktop_user ]] || desktop_user=$(getent passwd 1000 | cut -d: -f1)
+desktop_home=$(getent passwd "$desktop_user" | cut -d: -f6)
+config=$desktop_home/.config/hypr/hyprland.lua
+gmux=/sys/kernel/debug/apple_gmux
+
+intel_panel_connected() {
+  local connector card device name
+  for connector in /sys/class/drm/card*-eDP-*/status /sys/class/drm/card*-LVDS-*/status; do
+    [[ -e $connector ]] || continue
+    name=$(basename "${connector%/status}")
+    card=/sys/class/drm/${name%%-*}
+    device=$(basename "$(readlink -f "$card/device")")
+    [[ $device == 0000:00:02.0 ]] || continue
+    [[ $(cat "$connector") == connected ]] && return 0
+  done
+  return 1
+}
+
+for _ in $(seq 1 60); do
+  if intel_panel_connected && pgrep -x Hyprland >/dev/null; then
+    break
+  fi
+  sleep 1
+done
+
+intel_panel_connected || {
+  echo 'Refusing to power down Radeon: Intel does not own a connected internal panel' >&2
+  exit 1
+}
+grep -Fq 'hl.env("AQ_DRM_DEVICES", "/dev/dri/intel-igpu")' "$config" || {
+  echo 'Refusing to power down Radeon: Hyprland is not pinned to Intel' >&2
+  exit 1
+}
+
+if [[ -e /sys/bus/pci/devices/0000:01:00.0/driver ]] || [[ -d /sys/module/amdgpu ]]; then
+  echo 'Refusing to cut Radeon power while amdgpu is bound or loaded' >&2
+  exit 1
+fi
+
+# The HDMI function can bind independently even though amdgpu is blacklisted.
+# The managed kernel command line disables its second snd_hda_intel instance
+# before userspace can open it. Never unbind it here: snd_card_free can block
+# indefinitely once PipeWire has observed the card.
+radeon_audio=/sys/bus/pci/devices/0000:01:00.1
+[[ ! -e $radeon_audio/driver ]] || {
+  echo 'Radeon HDMI audio is bound; refusing to cut Radeon power (check snd_hda_intel.enable=1,0)' >&2
+  exit 1
+}
+[[ -w $gmux/selected_port && -w $gmux/selected_port_data ]] || {
+  echo 'Apple gmux debug interface is unavailable' >&2
+  exit 1
+}
+
+# Match apple-gmux.c: write 1 then 0 to GMUX_PORT_DISCRETE_POWER (0x50).
+echo 0x50 >"$gmux/selected_port"
+printf '\001' >"$gmux/selected_port_data"
+printf '\000' >"$gmux/selected_port_data"
+sleep 0.25
+
+power_state=unknown
+[[ -r /sys/bus/pci/devices/0000:01:00.0/power_state ]] &&
+  power_state=$(cat /sys/bus/pci/devices/0000:01:00.0/power_state)
+echo "Radeon power rails disabled through Apple gmux; PCI power_state=$power_state"

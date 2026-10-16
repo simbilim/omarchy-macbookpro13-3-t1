@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Optional add-on for an existing MacBook T1 kit installation.
+set -euo pipefail
+[[ $EUID == 0 ]] || { echo 'Run as root' >&2; exit 1; }
+[[ $(cat /sys/class/dmi/id/product_name) == MacBookPro13,3 ]] || exit 1
+repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+config=/etc/macbook-t1-omarchy.conf
+[[ -f $config && ! -L $config ]] || exit 1
+[[ -x /usr/local/sbin/macbook-t1-omarchy-maintain ]] || exit 1
+pacman -Q linux-lts linux-lts-headers >/dev/null
+if rg -q '^OMARCHY_ENABLE_REMOTE_MAINTENANCE=1$' "$config"; then
+  echo 'Disable the remote-maintenance lid override before installing the mobile profile' >&2
+  exit 1
+fi
+
+backup=/var/lib/macbook-t1-omarchy/mobile-backup-$(date +%Y%m%d-%H%M%S)
+install -d -m 0700 "$backup"
+save() {
+  local path=$1
+  [[ ! -L $path ]] || { echo "Refusing symlink: $path" >&2; exit 1; }
+  if [[ -e $path ]]; then
+    cp --parents -a "$path" "$backup/"
+  fi
+}
+put() {
+  local source=$1 target=$2 mode=$3
+  save "$target"
+  install -D -o root -g root -m "$mode" "$repo_dir/$source" "$target"
+}
+
+save "$config"
+save /boot/limine.conf
+put scripts/macbook-t1-sleep /usr/local/sbin/macbook-t1-sleep 0755
+put scripts/macbook-sleep-diagnostics /usr/local/sbin/macbook-sleep-diagnostics 0755
+put scripts/macbook-t1-touchbar-resume-fix /usr/local/sbin/macbook-t1-touchbar-resume-fix 0755
+put scripts/install-ec-wake-dkms /usr/local/sbin/macbook-t1-install-ec-wake-dkms 0755
+put scripts/install-socw-dkms /usr/local/sbin/macbook-t1-install-socw-dkms 0755
+put scripts/install-tb-nod3-dkms /usr/local/sbin/macbook-t1-install-tb-nod3-dkms 0755
+put scripts/macbook-t1-touchbar-display /usr/local/sbin/macbook-t1-touchbar-display 0755
+put systemd/macbook-t1-touchbar-display.service /etc/systemd/system/macbook-t1-touchbar-display.service 0644
+put scripts/macbook-t1-preferred-kernel /usr/local/sbin/macbook-t1-preferred-kernel 0755
+put scripts/macbook-t1-omarchy-maintain /usr/local/sbin/macbook-t1-omarchy-maintain 0755
+put scripts/macbook-t1-gpu-pref /usr/local/sbin/macbook-t1-gpu-pref 0755
+put scripts/macbook-t1-igd-boot-check /usr/local/sbin/macbook-t1-igd-boot-check 0755
+put scripts/macbook-t1-radeon-off /usr/local/sbin/macbook-t1-radeon-off 0755
+put systemd/macbook-t1-igd-boot-check.service /etc/systemd/system/macbook-t1-igd-boot-check.service 0644
+put systemd/macbook-t1-radeon-off.service /etc/systemd/system/macbook-t1-radeon-off.service 0644
+put scripts/dri-symlinks /usr/local/sbin/macbook-t1-dri-symlinks 0755
+put systemd/macbook-t1-dri-symlinks.service /etc/systemd/system/macbook-t1-dri-symlinks.service 0644
+put systemd/sddm-20-macbook-t1-dri-ordering.conf /etc/systemd/system/sddm.service.d/20-macbook-t1-dri-ordering.conf 0644
+put hooks/pacman/99-macbook-t1-omarchy-maintain.hook /etc/pacman.d/hooks/99-macbook-t1-omarchy-maintain.hook 0644
+put hooks/macbook-t1-preferred-kernel /etc/boot/hooks/post.d/81-macbook-t1-preferred-kernel 0755
+put systemd/sleep-91-macbook-t1-deep.conf /etc/systemd/sleep.conf.d/91-macbook-t1-deep.conf 0644
+put systemd/logind-91-macbook-t1-suspend.conf /etc/systemd/logind.conf.d/91-macbook-t1-suspend.conf 0644
+put systemd/suspend-90-macbook-t1.conf /etc/systemd/system/systemd-suspend.service.d/90-macbook-t1.conf 0644
+put systemd/suspend-95-macbook-t1-diagnostics.conf /etc/systemd/system/systemd-suspend.service.d/95-macbook-sleep-diagnostics.conf 0644
+put systemd/user/xdg-desktop-portal-hyprland-pipewire.conf /etc/systemd/user/xdg-desktop-portal-hyprland.service.d/90-macbook-pipewire-lifecycle.conf 0644
+put mkinitcpio/zz-macbook-t1-early-kms.conf /etc/mkinitcpio.conf.d/zz-macbook-t1-early-kms.conf 0644
+put limine-entry-tool.d/macbook13-stability.conf /etc/limine-entry-tool.d/macbook13-stability.conf 0644
+put pipewire/90-macbook-t1-cs8409-rate.conf /etc/pipewire/pipewire.conf.d/90-macbook-t1-cs8409-rate.conf 0644
+put pipewire/91-macbook-t1-speaker-protect.conf /etc/pipewire/pipewire.conf.d/91-macbook-t1-speaker-protect.conf 0644
+put libinput/local-overrides.quirks /etc/libinput/local-overrides.quirks 0644
+rm -f /etc/pipewire/pipewire.conf.d/92-macbook-t1-speaker-dsp-4ch.conf
+rm -f /etc/systemd/sleep.conf.d/91-macbook-t1-s2idle.conf
+rm -f /etc/systemd/logind.conf.d/91-macbook-t1-s2idle.conf
+rm -f /etc/initcpio/hooks/macbook-t1-resume
+rm -f /etc/initcpio/install/macbook-t1-resume
+rm -f /etc/mkinitcpio.conf.d/zz-macbook-t1-resume.conf
+systemctl disable --now macbook-t1-radeon-d3cold.service >/dev/null 2>&1 || true
+rm -rf /etc/systemd/system/macbook-t1-radeon-d3cold.service.d
+rm -f /etc/systemd/system/macbook-t1-radeon-d3cold.service
+sed -i 's/^OMARCHY_ENABLE_LID_HIBERNATE=1$/OMARCHY_ENABLE_LID_HIBERNATE=0/' "$config"
+/usr/local/sbin/macbook-t1-touchbar-resume-fix
+"$repo_dir/scripts/install-ec-wake-dkms"
+"$repo_dir/scripts/install-socw-dkms"
+"$repo_dir/scripts/install-tb-nod3-dkms"
+install -d -m 0700 /var/lib/macbook-t1-omarchy/efi-gpu
+touch /var/lib/macbook-t1-omarchy/efi-gpu/igd-boot-pending
+gpu_status=$(/usr/local/sbin/macbook-t1-gpu-pref status)
+if ! grep -q '^efi-preference=integrated$' <<<"$gpu_status"; then
+  /usr/local/sbin/macbook-t1-gpu-pref integrated
+fi
+limine-mkinitcpio
+/usr/local/sbin/macbook-t1-preferred-kernel
+systemctl daemon-reload
+desktop_user=$(awk -F= '$1 == "OMARCHY_USER" { print $2; exit }' "$config")
+[[ -n $desktop_user && $desktop_user != root ]]
+desktop_uid=$(id -u "$desktop_user")
+runuser -u "$desktop_user" -- env XDG_RUNTIME_DIR="/run/user/$desktop_uid" \
+  systemctl --user daemon-reload
+systemd-analyze verify systemd-suspend.service macbook-t1-radeon-off.service macbook-t1-touchbar-display.service
+systemctl enable --now macbook-t1-touchbar-display.service
+systemctl enable macbook-t1-igd-boot-check.service macbook-t1-radeon-off.service macbook-t1-dri-symlinks.service
+echo "Mobile profile installed; previous files saved in $backup"
+echo 'Reboot to apply the lid policy, then verify sleep and wake on the physical laptop.'

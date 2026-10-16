@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID == 0 ]] || exec sudo bash "$0" "$@"
+[[ $(cat /sys/class/dmi/id/product_name) == MacBookPro13,3 ]] || {
+  echo 'This module is restricted to MacBookPro13,3' >&2
+  exit 1
+}
+
+module=macbook-t1-tb-nod3
+version=0.1
+dkms_source="/usr/src/$module-$version"
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo_source=$(cd "$script_dir/.." 2>/dev/null && pwd)/dkms/$module
+
+if [[ -f $repo_source/dkms.conf && -f $repo_source/macbook_t1_tb_nod3.c ]]; then
+  source_dir=$repo_source
+elif [[ -f $dkms_source/dkms.conf && -f $dkms_source/macbook_t1_tb_nod3.c ]]; then
+  source_dir=$dkms_source
+else
+  echo "Could not find the $module DKMS source" >&2
+  exit 1
+fi
+
+command -v dkms >/dev/null
+dkms remove -m "$module" -v "$version" --all >/dev/null 2>&1 || true
+
+if [[ $source_dir != "$dkms_source" ]]; then
+  rm -rf -- "$dkms_source"
+  install -d -m 0755 "$dkms_source"
+  install -m 0644 "$source_dir/Makefile" "$source_dir/dkms.conf" \
+    "$source_dir/macbook_t1_tb_nod3.c" "$dkms_source/"
+fi
+
+dkms add -m "$module" -v "$version"
+installed=0
+for kernel_dir in /usr/lib/modules/*; do
+  [[ -d $kernel_dir/build ]] || continue
+  kernel=${kernel_dir##*/}
+  dkms build -m "$module" -v "$version" -k "$kernel"
+  dkms install -m "$module" -v "$version" -k "$kernel"
+  installed=1
+done
+(( installed == 1 )) || {
+  echo 'No installed kernel headers found' >&2
+  exit 1
+}
+
+printf '%s\n' macbook_t1_tb_nod3 > /etc/modules-load.d/macbook-t1-tb-nod3.conf
+if [[ -d /sys/module/macbook_t1_tb_nod3 ]]; then
+  modprobe -r macbook_t1_tb_nod3
+fi
+modprobe macbook_t1_tb_nod3
+lsmod | grep -q '^macbook_t1_tb_nod3 '
+dkms status -m "$module"

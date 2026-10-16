@@ -1,0 +1,21 @@
+[Unit]
+Description=Match the MacBook T1 Touch Bar to the internal screen power state
+After=t1-touchbar.service
+ConditionPathExists=/sys/class/dmi/id/product_name
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/macbook-t1-touchbar-display
+Restart=on-failure
+RestartSec=3s
+RuntimeDirectory=macbook-t1-touchbar-display
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=restart
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+PrivateTmp=yes
+TimeoutStopSec=5s
+
+[Install]
+WantedBy=graphical.target

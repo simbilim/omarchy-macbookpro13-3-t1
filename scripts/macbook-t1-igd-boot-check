@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Keep the normal Intel-only boot recoverable if Apple firmware resets its
+# startup GPU preference after a fully depleted battery or NVRAM reset.
+set -euo pipefail
+
+[[ $EUID == 0 ]] || { echo 'Run as root' >&2; exit 1; }
+[[ $(cat /sys/class/dmi/id/product_name) == MacBookPro13,3 ]] || exit 0
+
+state_dir=/var/lib/macbook-t1-omarchy/efi-gpu
+pending=$state_dir/igd-boot-pending
+recovery_attempted=$state_dir/igd-auto-reboot-attempted
+result=$state_dir/igd-boot-result
+gpu_pref=/usr/local/sbin/macbook-t1-gpu-pref
+install -d -m 0700 "$state_dir"
+
+intel_panel_connected() {
+  local connector card device name
+  for connector in /sys/class/drm/card*-eDP-* /sys/class/drm/card*-LVDS-*; do
+    [[ -e $connector/status ]] || continue
+    name=$(basename "$connector")
+    card=/sys/class/drm/${name%%-*}
+    device=$(basename "$(readlink -f "$card/device")")
+    [[ $device == 0000:00:02.0 ]] || continue
+    [[ $(cat "$connector/status") == connected ]] && return 0
+  done
+  return 1
+}
+
+for _ in $(seq 1 30); do
+  if intel_panel_connected; then
+    if [[ $($gpu_pref status | sed -n 's/^efi-preference=//p') != integrated ]]; then
+      $gpu_pref integrated >"$result" 2>&1
+    fi
+    printf 'integrated display connected at %s\n' "$(date --iso-8601=seconds)" >"$result"
+    rm -f "$pending" "$recovery_attempted"
+    exit 0
+  fi
+  sleep 1
+done
+
+# Rescue boots may intentionally use another GPU. Only repair the normal boot,
+# whose command line excludes amdgpu and therefore requires the Intel panel.
+if ! grep -Eq '(^| )module_blacklist=([^ ]*,)*amdgpu(,| |$)' /proc/cmdline; then
+  printf 'No Intel panel on a Radeon-capable rescue boot at %s; leaving GPU preference unchanged.\n' \
+    "$(date --iso-8601=seconds)" >"$result"
+  rm -f "$pending"
+  exit 0
+fi
+
+preference=$($gpu_pref status | sed -n 's/^efi-preference=//p')
+if [[ $preference != integrated && ! -e $recovery_attempted ]]; then
+  {
+    printf 'Intel-only boot started with EFI preference %s at %s.\n' \
+      "$preference" "$(date --iso-8601=seconds)"
+    $gpu_pref integrated
+    printf 'Rebooting once with the integrated GPU preference.\n'
+  } >"$result" 2>&1
+  touch "$recovery_attempted"
+  rm -f "$pending"
+  systemctl --no-block reboot
+  exit 0
+fi
+
+{
+  printf 'Intel panel was not connected at %s.\n' "$(date --iso-8601=seconds)"
+  printf 'EFI preference is %s; automatic reboot is suppressed to prevent a loop.\n' "$preference"
+} >"$result"
+rm -f "$pending"
+exit 1

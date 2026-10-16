@@ -1,0 +1,14 @@
+[Unit]
+Description=Power down inactive MacBook Radeon after Intel desktop starts
+After=display-manager.service
+Before=sleep.target
+ConditionPathExists=/sys/kernel/debug/apple_gmux/selected_port_data
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/macbook-t1-radeon-off
+TimeoutStartSec=75s
+
+[Install]
+WantedBy=graphical.target

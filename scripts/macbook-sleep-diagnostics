@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# Record closed-lid wake and battery evidence around a suspend cycle.
+set -u
+[[ $EUID == 0 ]] || exit 1
+[[ $(< /sys/class/dmi/id/product_name) == MacBookPro13,3 ]] || exit 0
+state=/run/macbook-sleep-diagnostics
+phase=${1:-}
+operation=${2:-unknown}
+
+read_value() {
+  local path=$1 value
+  [[ -r $path ]] || return 0
+  value=$(< "$path") || value=unavailable
+  printf '%s=%s\n' "$path" "$value"
+}
+
+read_driver() {
+  local device=$1 driver=unbound
+  if [[ -L /sys/bus/pci/devices/$device/driver ]]; then
+    driver=$(basename "$(readlink -e "/sys/bus/pci/devices/$device/driver")")
+  fi
+  printf '/sys/bus/pci/devices/%s/driver=%s\n' "$device" "$driver"
+}
+
+# On this machine 446676598680 is the all-ones 32-bit PMC register
+# scaled by the driver's 104 us tick. Its unchanged value is not 0% S0ix.
+# Keep MSR-based package counters separate from these suspect MMIO reads.
+valid_slp_s0_counter() {
+  [[ $1 =~ ^[0-9]+$ && $1 != 446676598680 ]]
+}
+
+case $phase in
+  pre)
+    install -d -m 0700 "$state"
+    date +%s > "$state/epoch"
+    for field in charge_now voltage_now status; do
+      [[ -r /sys/class/power_supply/BAT0/$field ]] &&
+        cat "/sys/class/power_supply/BAT0/$field" > "$state/$field"
+    done
+    rm -f "$state/slp_s0_residency_usec"
+    if [[ -r /sys/kernel/debug/pmc_core/slp_s0_residency_usec ]]; then
+      counter=$(< /sys/kernel/debug/pmc_core/slp_s0_residency_usec)
+      if valid_slp_s0_counter "$counter"; then
+        printf '%s\n' "$counter" > "$state/slp_s0_residency_usec"
+      else
+        printf 'MacBook sleep SLP_S0 residency: unavailable (invalid PMC counter: %s)\n' "$counter"
+      fi
+    fi
+    if [[ -r /sys/kernel/debug/pmc_core/package_cstate_show ]]; then
+      cat /sys/kernel/debug/pmc_core/package_cstate_show > "$state/package_cstate_show"
+    fi
+    pmc_warn=/sys/module/intel_pmc_core/parameters/warn_on_s0ix_failures
+    if [[ -r $state/slp_s0_residency_usec && -r $pmc_warn && -w $pmc_warn ]]; then
+      cat "$pmc_warn" > "$state/warn_on_s0ix_failures"
+      printf 'Y\n' > "$pmc_warn"
+    fi
+    : > "$state/gpe"
+    for path in /sys/firmware/acpi/interrupts/gpe[0-9a-f][0-9a-f]; do
+      [[ -r $path ]] || continue
+      read -r count _ < "$path"
+      [[ $count =~ ^[0-9]+$ ]] || continue
+      printf '%s %s\n' "${path##*/}" "$count" >> "$state/gpe"
+    done
+    [[ -w /sys/power/pm_debug_messages ]] && printf '1\n' > /sys/power/pm_debug_messages
+    [[ -w /sys/power/pm_print_times ]] && printf '1\n' > /sys/power/pm_print_times
+    ;;
+  post)
+    if [[ -r $state/epoch && -r $state/charge_now && -r $state/voltage_now &&
+          -r $state/status && -r /sys/class/power_supply/BAT0/status ]]; then
+      now=$(date +%s)
+      before_epoch=$(< "$state/epoch")
+      before_charge=$(< "$state/charge_now")
+      before_voltage=$(< "$state/voltage_now")
+      after_charge=$(< /sys/class/power_supply/BAT0/charge_now)
+      after_voltage=$(< /sys/class/power_supply/BAT0/voltage_now)
+      before_status=$(< "$state/status")
+      after_status=$(< /sys/class/power_supply/BAT0/status)
+      if [[ $now =~ ^[0-9]+$ && $before_epoch =~ ^[0-9]+$ &&
+            $before_charge =~ ^[0-9]+$ && $after_charge =~ ^[0-9]+$ &&
+            $before_voltage =~ ^[0-9]+$ && $after_voltage =~ ^[0-9]+$ &&
+            $now -gt $before_epoch ]]; then
+        if [[ $before_status == Discharging && $after_status == Discharging &&
+              $before_charge -ge $after_charge ]]; then
+          awk -v elapsed="$((now - before_epoch))" \
+            -v delta="$((before_charge - after_charge))" \
+            -v v1="$before_voltage" -v v2="$after_voltage" \
+          'BEGIN { watts=delta*((v1+v2)/2)*3600/(elapsed*1e12); printf "MacBook sleep measurement: elapsed_s=%d charge_delta_uAh=%d estimated_avg_W=%.3f\n", elapsed, delta, watts }'
+        else
+          printf 'MacBook sleep battery delta: elapsed_s=%d charge_delta_uAh=%d; power estimate unavailable (status=%s->%s or charge increased)\n' \
+            "$((now - before_epoch))" "$((before_charge - after_charge))" \
+            "$before_status" "$after_status"
+        fi
+      fi
+    fi
+    if [[ -r $state/gpe ]]; then
+      while read -r name before; do
+        path=/sys/firmware/acpi/interrupts/$name
+        [[ -r $path ]] || continue
+        read -r after _ < "$path"
+        [[ $after =~ ^[0-9]+$ && $after -gt $before ]] &&
+          printf 'MacBook sleep GPE delta: %s=%d\n' "$name" "$((after - before))"
+      done < "$state/gpe"
+    fi
+    if [[ -r $state/slp_s0_residency_usec &&
+          -r /sys/kernel/debug/pmc_core/slp_s0_residency_usec &&
+          -r $state/epoch ]]; then
+      now=$(date +%s)
+      before_epoch=$(< "$state/epoch")
+      before_residency=$(< "$state/slp_s0_residency_usec")
+      after_residency=$(< /sys/kernel/debug/pmc_core/slp_s0_residency_usec)
+      if ! valid_slp_s0_counter "$before_residency" ||
+         ! valid_slp_s0_counter "$after_residency"; then
+        printf 'MacBook sleep SLP_S0 residency: unavailable (invalid PMC counter)\n'
+      elif [[ $now =~ ^[0-9]+$ && $before_epoch =~ ^[0-9]+$ &&
+            $before_residency =~ ^[0-9]+$ && $after_residency =~ ^[0-9]+$ &&
+            $now -gt $before_epoch && $after_residency -ge $before_residency ]]; then
+        awk -v elapsed="$((now - before_epoch))" \
+            -v delta="$((after_residency - before_residency))" \
+          'BEGIN { printf "MacBook sleep SLP_S0 residency: delta_us=%d residency_pct=%.1f\n", delta, delta/(elapsed*10000) }'
+      fi
+    fi
+    if [[ -r $state/package_cstate_show &&
+          -r /sys/kernel/debug/pmc_core/package_cstate_show ]]; then
+      while read -r _ cstate _ before; do
+        [[ $cstate =~ ^C[0-9]+$ && $before =~ ^[0-9]+$ ]] || continue
+        after=$(awk -v wanted="$cstate" '$2 == wanted { print $4 }' \
+          /sys/kernel/debug/pmc_core/package_cstate_show)
+        [[ $after =~ ^[0-9]+$ && $after -ge $before ]] || continue
+        printf 'MacBook sleep package residency delta: %s=%d\n' \
+          "$cstate" "$((after - before))"
+      done < "$state/package_cstate_show"
+    fi
+    if [[ -r $state/warn_on_s0ix_failures &&
+          -w /sys/module/intel_pmc_core/parameters/warn_on_s0ix_failures ]]; then
+      cat "$state/warn_on_s0ix_failures" > \
+        /sys/module/intel_pmc_core/parameters/warn_on_s0ix_failures
+    fi
+    ;;
+  *) exit 0 ;;
+esac
+
+printf 'MacBook sleep diagnostics: phase=%s operation=%s\n' "$phase" "$operation"
+for path in /proc/acpi/button/lid/LID0/state /sys/power/mem_sleep \
+  /sys/power/pm_wakeup_irq /sys/class/rtc/rtc0/wakealarm \
+  /sys/class/power_supply/BAT0/status /sys/class/power_supply/BAT0/capacity \
+  /sys/class/power_supply/BAT0/charge_now /sys/class/power_supply/BAT0/current_now \
+  /sys/class/power_supply/BAT0/voltage_now /sys/class/power_supply/BAT0/temp \
+  /sys/firmware/acpi/interrupts/gpe07 \
+  /sys/firmware/acpi/interrupts/gpe17 \
+  /sys/bus/spi/devices/spi-APP000D:00/power/wakeup \
+  /sys/bus/pci/devices/0000:00:14.0/power/wakeup \
+  /sys/bus/pci/devices/0000:07:00.0/power/wakeup \
+  /sys/bus/pci/devices/0000:7d:00.0/power/wakeup \
+  /sys/bus/pci/devices/0000:00:02.0/power/runtime_status \
+  /sys/bus/pci/devices/0000:00:1f.3/power/runtime_status \
+  /sys/bus/pci/devices/0000:03:00.0/power/runtime_status \
+  /sys/bus/pci/devices/0000:01:00.1/power/runtime_status \
+  /sys/bus/pci/devices/0000:01:00.1/power_state \
+  /sys/kernel/debug/pmc_core/slp_s0_residency_usec \
+  /sys/power/suspend_stats/last_failed_dev /sys/power/suspend_stats/last_failed_step; do
+  read_value "$path"
+done
+for device in 0000:01:00.0 0000:01:00.1 0000:06:00.0 0000:7c:00.0 \
+              0000:07:00.0 0000:7d:00.0 0000:00:1f.3; do
+  read_driver "$device"
+  for field in power_state power/runtime_status power/control; do
+    read_value "/sys/bus/pci/devices/$device/$field"
+  done
+done
+for path in /sys/class/power_supply/*/online; do
+  read_value "$path"
+done
+if [[ -r /proc/acpi/wakeup ]]; then
+  awk '$1 ~ /^(XHC1|XHC2|XHC3|SPIT|LID0)$/ { print "/proc/acpi/wakeup: " $0 }' \
+    /proc/acpi/wakeup
+fi
+if [[ -r /sys/kernel/debug/wakeup_sources ]]; then
+  awk 'NR == 1 || $2 != 0 || $3 != 0' /sys/kernel/debug/wakeup_sources
+fi
+for codec in /proc/asound/card*/codec#*; do
+  [[ -r $codec ]] || continue
+  grep -q '^Codec: Cirrus Logic CS8409' "$codec" || continue
+  card=${codec%/*}
+  for status in "$card"/pcm*/sub*/status; do
+    [[ -r $status ]] || continue
+    IFS= read -r stream_state < "$status"
+    printf '%s=%s\n' "$status" "$stream_state"
+  done
+done
+
+if [[ $phase == post ]]; then
+  rm -f "$state/epoch" "$state/charge_now" "$state/voltage_now" "$state/status" \
+    "$state/gpe" "$state/slp_s0_residency_usec" "$state/package_cstate_show" \
+    "$state/warn_on_s0ix_failures"
+  rmdir "$state" 2>/dev/null || true
+fi
+exit 0

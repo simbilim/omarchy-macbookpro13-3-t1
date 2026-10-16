@@ -1,0 +1,5 @@
+[MacBookPro13,3 Apple SPI Keyboard]
+MatchName=Apple SPI Keyboard
+MatchUdevType=keyboard
+MatchDMIModalias=dmi:*:pnMacBookPro13,3:*
+AttrKeyboardIntegration=internal

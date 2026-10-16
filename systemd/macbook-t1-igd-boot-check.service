@@ -1,0 +1,10 @@
+[Unit]
+Description=Validate and recover the MacBook Intel display boot
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/macbook-t1-igd-boot-check
+
+[Install]
+WantedBy=multi-user.target

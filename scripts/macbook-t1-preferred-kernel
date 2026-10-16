@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Keep the verified LTS default and linux-omarchy rescue entries current."""
+import hashlib
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import sys
+import tempfile
+from datetime import datetime
+
+TITLE = "Omarchy LTS - MacBook"
+BEGIN = "# BEGIN MacBook T1 preferred kernel"
+END = "# END MacBook T1 preferred kernel"
+RESCUE_TITLES = (
+    "Omarchy Rescue - Safe Graphics",
+    "Omarchy Rescue - Console",
+)
+
+
+def _refresh_rescue_entries(text, image):
+    digest = hashlib.blake2b(image).hexdigest()
+    replacement = "boot():/EFI/Linux/omarchy_linux-omarchy.efi#" + digest
+    allowed_path = re.compile(
+        r"boot\(\):/EFI/Linux/omarchy_linux(?:-omarchy)?[.]efi"
+        r"(?:#[0-9a-fA-F]{128})?"
+    )
+    for title in RESCUE_TITLES:
+        match = re.search(
+            r"^/" + re.escape(title) + r"[ \t]*\n(.*?)(?=^/|\Z)",
+            text, re.M | re.S,
+        )
+        if match is None:
+            raise ValueError("missing rescue entry: " + title)
+        body = match.group(1)
+        protocols = re.findall(r"^[ \t]*protocol:[ \t]*(.+)$", body, re.M)
+        paths = re.findall(r"^[ \t]*path:[ \t]*(.+)$", body, re.M)
+        if protocols != ["efi"] or len(paths) != 1:
+            raise ValueError("invalid rescue entry: " + title)
+        if allowed_path.fullmatch(paths[0]) is None:
+            raise ValueError("unexpected rescue image path: " + title)
+        new_body = re.sub(
+            r"(^[ \t]*path:[ \t]*).+$", r"\g<1>" + replacement,
+            body, count=1, flags=re.M,
+        )
+        text = text[:match.start(1)] + new_body + text[match.end(1):]
+    return text
+
+
+def render(text, image, rescue_image):
+    if len(re.findall(r"(?m)^default_entry:", text)) != 1:
+        raise ValueError("expected exactly one default_entry setting")
+    # Match a generated kernel entry, not a kernel nested under a snapshot.
+    matches = list(re.finditer(
+        r"^[ \t]*//linux-lts[ \t]*\n(.*?)(?=^[ \t]*/|\Z)", text, re.M | re.S
+    ))
+    if len(matches) != 1:
+        raise ValueError("expected exactly one generated linux-lts entry")
+    body = matches[0].group(1)
+    values = {}
+    for key in ("protocol", "path", "cmdline"):
+        found = re.findall(r"^[ \t]*" + key + r":[ \t]*(.+)$", body, re.M)
+        if len(found) != 1:
+            raise ValueError("missing or ambiguous generated LTS " + key)
+        values[key] = found[0]
+    if values["protocol"] != "efi":
+        raise ValueError("LTS entry is not an EFI image")
+    expected_path = "boot():/EFI/Linux/omarchy_linux-lts.efi#"
+    if not values["path"].startswith(expected_path):
+        raise ValueError("unexpected LTS image path")
+    digest = hashlib.blake2b(image).hexdigest()
+    if values["path"][len(expected_path):] != digest:
+        raise ValueError("generated LTS image hash does not match the image")
+
+    # Limine's writer can remove # markers, so also recognize our exact title.
+    text = re.sub(r"(?m)^" + re.escape(BEGIN) + r"\n?", "", text)
+    text = re.sub(r"(?m)^" + re.escape(END) + r"\n?", "", text)
+    text = re.sub(
+        r"^[ \t]*/" + re.escape(TITLE) + r"[ \t]*\n.*?(?=^[ \t]*/|\Z)",
+        "", text, flags=re.M | re.S,
+    )
+    first = re.search(r"^[ \t]*/", text, re.M)
+    if first is None:
+        raise ValueError("no existing boot entries")
+    block = (
+        BEGIN + "\n/" + TITLE + "\n"
+        "    comment: LTS kernel with the MacBook T1 stability settings.\n"
+        + "".join("    " + key + ": " + values[key] + "\n"
+                  for key in ("protocol", "path", "cmdline"))
+        + END + "\n\n"
+    )
+    text = text[:first.start()] + block + text[first.start():]
+    text = re.sub(r"(?m)^default_entry:[^\n]*$", "default_entry: 1", text)
+    return _refresh_rescue_entries(text, rescue_image)
+
+
+def main():
+    if os.geteuid() != 0:
+        raise ValueError("run as root")
+    if Path("/sys/class/dmi/id/product_name").read_text().strip() != "MacBookPro13,3":
+        raise ValueError("unsupported model")
+    config = Path("/boot/limine.conf")
+    image = Path("/boot/EFI/Linux/omarchy_linux-lts.efi")
+    rescue_image = Path("/boot/EFI/Linux/omarchy_linux-omarchy.efi")
+    if config.is_symlink() or image.is_symlink() or rescue_image.is_symlink():
+        raise ValueError("refusing symlinked boot files")
+    old = config.read_text()
+    new = render(old, image.read_bytes(), rescue_image.read_bytes())
+    if sys.argv[1:] == ["--check"]:
+        if old != new:
+            raise ValueError("managed boot entries are stale")
+        print("LTS default and linux-omarchy rescue image hashes verified")
+        return
+    if sys.argv[1:]:
+        raise ValueError("usage: macbook-t1-preferred-kernel [--check]")
+    if old == new:
+        return
+    backup = config.with_name("limine.conf.before-preferred-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
+    shutil.copy2(config, backup)
+    fd, temporary = tempfile.mkstemp(prefix=".limine-preferred-", dir=config.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(new)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, stat.S_IMODE(config.stat().st_mode))
+        os.replace(temporary, config)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    print("Updated managed LTS boot entry; generated image hash verified")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError) as error:
+        print("FAIL: " + str(error), file=sys.stderr)
+        sys.exit(1)

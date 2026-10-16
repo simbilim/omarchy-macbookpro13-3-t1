@@ -1,7 +1,7 @@
 [Unit]
 Description=Create stable MacBookPro13,3 DRI symlinks before the display manager
 DefaultDependencies=no
-After=systemd-udevd.service systemd-udev-trigger.service macbook-t1-radeon-d3cold.service
+After=systemd-udevd.service systemd-udev-trigger.service
 Before=display-manager.service
 
 [Service]

@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# The 0.1 T1 driver registers reset_resume but omits normal resume.
+# T1 also has no separate display interface, unlike the original resume guard.
+# Its one-byte USB mode transfer must return zero to the state-machine worker.
+# Restore its state machine on both wake paths, without USB resets.
+set -euo pipefail
+[[ $EUID == 0 ]]
+[[ $(cat /sys/class/dmi/id/product_name) == MacBookPro13,3 ]]
+source_file=/usr/src/apple-ib-drv-0.1/apple-touchbar.c
+state_dir=/var/lib/macbook-t1-omarchy
+[[ -f $source_file && ! -L $source_file ]]
+install -d -m 0755 "$state_dir"
+python3 - <<'PY'
+from pathlib import Path
+from datetime import datetime
+import re, shutil
+p = Path('/usr/src/apple-ib-drv-0.1/apple-touchbar.c')
+s = p.read_text()
+candidate = s
+needle = '\t.suspend = appletb_suspend,\n\t.reset_resume = appletb_reset_resume,'
+signature = 'static int appletb_reset_resume(struct hid_device *hdev)'
+common = 'static int appletb_resume_common(struct hid_device *hdev, bool reset)'
+ending = '\treturn 0;\n}\n#endif\n\nstatic struct appletb_device *appletb_alloc_device'
+if common not in candidate or '\t.resume = appletb_resume,' not in candidate:
+    # Accept the initial local callback alias when updating this fix.
+    candidate = candidate.replace('\t.resume = appletb_reset_resume,\n', '')
+    if re.search(r'^\s*\.resume\s*=', candidate, re.M):
+        raise SystemExit('Unexpected existing Touch Bar resume callback; review driver update')
+    if any(candidate.count(part) != 1 for part in (needle, signature, ending, '\t\ttb_dev->restore_autopm = true;')):
+        raise SystemExit('Unsupported Touch Bar source; expected callback block not found')
+    candidate = candidate.replace(signature, common)
+    candidate = candidate.replace('\t\ttb_dev->restore_autopm = true;', '\t\ttb_dev->restore_autopm = reset;')
+    candidate = candidate.replace(ending, '''\treturn 0;
+}
+
+static int appletb_resume(struct hid_device *hdev)
+{
+\t/* A normal resume preserves the USB runtime-PM reference. */
+\treturn appletb_resume_common(hdev, false);
+}
+
+static int appletb_reset_resume(struct hid_device *hdev)
+{
+\treturn appletb_resume_common(hdev, true);
+}
+#endif
+
+static struct appletb_device *appletb_alloc_device''')
+    candidate = candidate.replace(needle, '\t.suspend = appletb_suspend,\n\t.resume = appletb_resume,\n\t.reset_resume = appletb_reset_resume,')
+old_guard = '''\tif ((tb_dev->mode_iface.hdev && !tb_dev->mode_iface.suspended) &&
+\t    (tb_dev->disp_iface.hdev && !tb_dev->disp_iface.suspended)) {'''
+new_guard = '''\tif ((tb_dev->mode_iface.hdev && !tb_dev->mode_iface.suspended) &&
+\t    (tb_dev->is_t1 ||
+\t     (tb_dev->disp_iface.hdev && !tb_dev->disp_iface.suspended))) {'''
+if candidate.count(old_guard) == 1 and new_guard not in candidate:
+    candidate = candidate.replace(old_guard, new_guard)
+elif candidate.count(new_guard) != 1 or old_guard in candidate:
+    raise SystemExit('Unsupported Touch Bar source; expected resume interface guard not found')
+old_transfer = '''\t\t} while (++tries < 5);
+\t} else {
+\t\trc = hid_hw_raw_request(tb_dev->mode_iface.hdev, report->id,'''
+new_transfer = '''\t\t} while (++tries < 5);
+
+\t\t/* usb_control_msg returns bytes; the worker expects zero on success. */
+\t\tif (rc >= 0)
+\t\t\trc = (rc == 1) ? 0 : -EIO;
+\t} else {
+\t\trc = hid_hw_raw_request(tb_dev->mode_iface.hdev, report->id,'''
+if candidate.count(old_transfer) == 1 and new_transfer not in candidate:
+    candidate = candidate.replace(old_transfer, new_transfer)
+elif candidate.count(new_transfer) != 1 or old_transfer in candidate:
+    raise SystemExit('Unsupported Touch Bar source; expected T1 mode transfer not found')
+if candidate == s:
+    raise SystemExit(0)
+state = Path('/var/lib/macbook-t1-omarchy')
+shutil.copy2(p, state / ('apple-touchbar.c.before-resume-' + datetime.now().strftime('%Y%m%d-%H%M%S')))
+(state / 'pending-touchbar-rebuild').touch()
+p.write_text(candidate)
+print('Repaired T1 Touch Bar resume, interface readiness and mode-transfer result')
+PY
+[[ -f $state_dir/pending-touchbar-rebuild ]] || exit 0
+count=0
+for headers in /usr/lib/modules/*/build; do
+  [[ -f $headers/Makefile ]] || continue
+  kernel=${headers%/build}
+  kernel=${kernel##*/}
+  dkms build --force -m apple-ib-drv -v 0.1 -k "$kernel"
+  dkms install --force -m apple-ib-drv -v 0.1 -k "$kernel"
+  count=$((count + 1))
+done
+(( count > 0 ))
+limine-mkinitcpio
+if [[ -x /usr/local/sbin/macbook-t1-preferred-kernel ]]; then
+  /usr/local/sbin/macbook-t1-preferred-kernel
+fi
+rm -f "$state_dir/pending-touchbar-rebuild"
+echo 'Touch Bar normal-resume fix built and installed; reboot to load it'

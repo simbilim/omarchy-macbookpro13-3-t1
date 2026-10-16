@@ -223,8 +223,14 @@ install -D -m 0755 "$repo_dir/scripts/macbook-t1-omarchy-maintain" /usr/local/sb
 install -D -m 0755 "$repo_dir/scripts/limine-unattended-fix" /usr/local/sbin/macbook-t1-limine-unattended-fix
 install -D -m 0755 "$repo_dir/scripts/dri-symlinks" /usr/local/sbin/macbook-t1-dri-symlinks
 install -D -m 0755 "$repo_dir/scripts/install-audio-dkms" /usr/local/sbin/macbook-t1-install-audio-dkms
+install -D -m 0755 "$repo_dir/scripts/install-ec-wake-dkms" /usr/local/sbin/macbook-t1-install-ec-wake-dkms
+install -D -m 0755 "$repo_dir/scripts/macbook-t1-gpu-pref" /usr/local/sbin/macbook-t1-gpu-pref
+install -D -m 0755 "$repo_dir/scripts/macbook-t1-igd-boot-check" /usr/local/sbin/macbook-t1-igd-boot-check
+install -D -m 0755 "$repo_dir/scripts/macbook-t1-radeon-off" /usr/local/sbin/macbook-t1-radeon-off
 
 install -D -m 0644 "$repo_dir/hooks/pacman/99-macbook-t1-omarchy-maintain.hook" /etc/pacman.d/hooks/99-macbook-t1-omarchy-maintain.hook
+install -D -m 0644 "$repo_dir/systemd/macbook-t1-igd-boot-check.service" /etc/systemd/system/macbook-t1-igd-boot-check.service
+install -D -m 0644 "$repo_dir/systemd/macbook-t1-radeon-off.service" /etc/systemd/system/macbook-t1-radeon-off.service
 
 OMARCHY_USER="$run_user" \
 OMARCHY_ENABLE_AUTOLOGIN="$enable_autologin" \
