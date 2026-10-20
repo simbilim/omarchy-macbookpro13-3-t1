@@ -28,7 +28,9 @@ De `i915`-resume van 4,7 s na S3 bestond uit circa 350 eDP-AUX-time-outs: de gmu
 
 Aanvulling 19 oktober (klep dicht, `Timekeeping suspended for`): met de remove/rescan-stap keerde de eerste S3 op de lader na 3,98 en 3,03 s terug en verdwenen beide USB-C-controllers; de direct volgende S3 hield 582 en 5593 s. Zonder remove/rescan (met `macbook-t1-tb-nod3` actief) hield S3 bij de eerste poging: lader 410,7 en 47,9 s, accu 360,4 en 87,7 s, steeds met beide controllers terug en een werkende USB-ethernet na insteken. De helper verwijdert de bomen daarom niet meer, kent geen laderregel meer en houdt de USB-C-xHCI's na iedere wake in D0. Logind `HoldoffTimeoutSec=5s` en opnieuw slapen bij een gesloten klep na wake vangen vroege wakes af.
 
-Open: geen blokkerende punten; nachtmeting met de vereenvoudigde helper.
+Nachtmeting met de vereenvoudigde helper (19→20 oktober): 28,7 uur S3 op accu, 6996 → 6977 mAh (19 mAh), beide USB-C-controllers daarna aanwezig. Een klepcyclus van 3,1 s (klep direct weer open) liet beide Alpine Ridge-bomen zonder voeding; een PCI-rescan vond alleen de upstreambruggen terug. Herstel door een volgende lange S3 is nog niet getest.
+
+Open: herstel van USB-C na een te korte S3; `SOCW(0)` vóór slaap.
 
 ## Actuele analyse, 2 oktober 2026
 
