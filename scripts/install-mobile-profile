@@ -44,6 +44,7 @@ put scripts/macbook-t1-omarchy-maintain /usr/local/sbin/macbook-t1-omarchy-maint
 put scripts/macbook-t1-gpu-pref /usr/local/sbin/macbook-t1-gpu-pref 0755
 put scripts/macbook-t1-igd-boot-check /usr/local/sbin/macbook-t1-igd-boot-check 0755
 put scripts/macbook-t1-radeon-off /usr/local/sbin/macbook-t1-radeon-off 0755
+put scripts/macbook-t1-brightness-control /usr/local/bin/macbook-t1-brightness-control 0755
 put systemd/macbook-t1-igd-boot-check.service /etc/systemd/system/macbook-t1-igd-boot-check.service 0644
 put systemd/macbook-t1-radeon-off.service /etc/systemd/system/macbook-t1-radeon-off.service 0644
 put scripts/dri-symlinks /usr/local/sbin/macbook-t1-dri-symlinks 0755

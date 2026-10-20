@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Brightness keys for the internal display: Omarchy's own behaviour from 1%
+# upwards, plus finer steps below it (0.8, 0.6, 0.4, 0.2%) for dark rooms.
+# Idea from mrdrbrdr/advanced-brightness-control-omarchy (MIT).
+#
+# Usage: macbook-t1-brightness-control up|down
+# Bound by the managed block in ~/.config/hypr/bindings.lua (macbook-t1-omarchy-maintain).
+set -euo pipefail
+
+action=${1:-}
+[[ $action == up || $action == down ]] || { echo "Usage: $0 up|down" >&2; exit 1; }
+
+device=$(omarchy-hw-display)
+current=$(brightnessctl -d "$device" get)
+max=$(brightnessctl -d "$device" max)
+
+# Raw value Omarchy's 1% step lands on (brightnessctl truncates).
+one_pct=$(( max / 100 ))
+fine_tenths=(2 4 6 8)                  # 0.2 .. 0.8 %
+
+fine_raw() { echo $(( (max * $1 + 500) / 1000 )); }
+
+# Show the value in Omarchy's OSD with a 0.1% resolution bar.
+osd_tenths() {
+  local t=$1 text
+  text="$(( t / 10 )).$(( t % 10 ))%"
+  [[ $text == *.0% ]] && text="${text%.0%}%"
+  omarchy-shell -q osd show "$(jq -cn --arg v "$t" --arg text "$text" \
+    '{icon:"brightness",message:"",value:$v,max:"1000",progressText:$text,duration:"1200"}')" >/dev/null 2>&1 || true
+}
+
+if [[ $action == down ]]; then
+  # Above 1%: Omarchy's own steps (5%, then 1% below 5%), which stop at 1%.
+  (( current > one_pct )) && exec omarchy-brightness-display 5%-
+  target=""
+  for (( i=${#fine_tenths[@]}-1; i>=0; i-- )); do
+    raw=$(fine_raw "${fine_tenths[i]}")
+    if (( raw < current )); then target=${fine_tenths[i]}; break; fi
+  done
+  if [[ -z $target ]]; then           # already at the lowest step: keep the OSD up
+    osd_tenths "${fine_tenths[0]}"
+    exit 0
+  fi
+else
+  (( current >= one_pct )) && exec omarchy-brightness-display +5%
+  target=""
+  for t in "${fine_tenths[@]}"; do
+    raw=$(fine_raw "$t")
+    if (( raw > current )); then target=$t; break; fi
+  done
+  # Above the highest fine step: hand back to Omarchy at exactly 1%.
+  [[ -n $target ]] || exec omarchy-brightness-display 1%
+fi
+
+brightnessctl -d "$device" set "$(fine_raw "$target")" >/dev/null
+osd_tenths "$target"

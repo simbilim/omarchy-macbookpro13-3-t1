@@ -579,6 +579,53 @@ chmod 0644 "$path"
 EOF
 }
 
+ensure_hypr_brightness_block() {
+  run_as_desktop_user <<'EOF'
+set -euo pipefail
+
+path="$USER_HOME/.config/hypr/bindings.lua"
+script=/usr/local/bin/macbook-t1-brightness-control
+[[ -f "$path" && ! -L "$path" ]] || {
+  echo "WARN: cannot manage brightness keys in missing or symlinked file: $path"
+  exit 0
+}
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+awk '
+  $0 == "-- BEGIN MacBookPro13,3 T1 brightness" { skip=1; next }
+  $0 == "-- END MacBookPro13,3 T1 brightness" { skip=0; next }
+  skip { next }
+  { print }
+' "$path" >"$tmp"
+perl -0pi -e 's/\n+\z/\n/' "$tmp"
+# The script delegates to these Omarchy commands. If an update removed one,
+# drop the block so the keys fall back to Omarchy's own bindings.
+missing=""
+for cmd in omarchy-brightness-display omarchy-hw-display omarchy-shell brightnessctl jq; do
+  command -v "$cmd" >/dev/null || missing+=" $cmd"
+done
+[[ -x $script ]] || missing+=" $script"
+if [[ -n $missing ]]; then
+  echo "WARN: brightness keys left at Omarchy defaults; missing:$missing"
+else
+  cat >>"$tmp" <<'LUA'
+-- BEGIN MacBookPro13,3 T1 brightness
+-- Omarchy brightness steps from 1% up, plus 0.8, 0.6, 0.4 and 0.2% below 1%.
+-- Shift+brightness keys keep Omarchy's minimum/maximum bindings.
+hl.unbind("XF86MonBrightnessUp")
+hl.unbind("XF86MonBrightnessDown")
+o.bind("XF86MonBrightnessUp", "Brightness up (fine below 1%)", "/usr/local/bin/macbook-t1-brightness-control up", { locked = true, repeating = true })
+o.bind("XF86MonBrightnessDown", "Brightness down (fine below 1%)", "/usr/local/bin/macbook-t1-brightness-control down", { locked = true, repeating = true })
+-- END MacBookPro13,3 T1 brightness
+LUA
+fi
+if ! cmp -s "$tmp" "$path"; then
+  cp "$tmp" "$path"
+  echo "updated: $path MacBookPro13,3 brightness block"
+fi
+EOF
+}
+
 ensure_omarchy_post_update_hook() {
   run_as_desktop_user <<'EOF'
 set -euo pipefail
@@ -961,6 +1008,7 @@ fi
 
 ensure_hypr_graphics_block
 ensure_hypr_trackpad_block
+ensure_hypr_brightness_block
 ensure_hypr_key_latency_guard
 
 if [[ -x /usr/local/sbin/macbook-t1-gpu-pref ]]; then
