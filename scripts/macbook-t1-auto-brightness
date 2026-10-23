@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Follow ambient light with the internal display brightness (MacBookPro13,3).
+
+Reads the T1 ambient light sensor (iio device "als") every few seconds and
+eases the gmux backlight towards a logarithmic curve. Manual changes win:
+the ratio between the user's level and the curve is kept for later
+targets, and levels below 1% (the fine steps of macbook-t1-brightness-control)
+are left alone until the user goes back above 1%.
+
+Settings in /etc/macbook-t1-omarchy.conf, re-read on every tick:
+  OMARCHY_AUTO_BRIGHTNESS=1|0             on or off (default 1)
+  OMARCHY_AUTO_BRIGHTNESS_CURVE=lux:%,... curve points (default 0:1,150:40,1000:100)
+"""
+import math
+import time
+from pathlib import Path
+
+CONF = Path("/etc/macbook-t1-omarchy.conf")
+DEFAULT_CURVE = "0:1,150:40,1000:100"
+INTERVAL_S = 5
+SMOOTHING = 0.4          # weight of a new light sample
+MIN_CHANGE = 0.10        # ignore corrections under 10% of the current level
+FADE_STEPS = 8
+FADE_S = 0.8
+
+
+def read_conf(path=CONF):
+    values = {}
+    try:
+        for line in path.read_text().splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                values[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return values
+
+
+def parse_curve(text):
+    points = []
+    for part in text.split(","):
+        lux, sep, pct = part.partition(":")
+        if not sep:
+            continue
+        try:
+            points.append((max(0.0, float(lux)), min(100.0, max(1.0, float(pct)))))
+        except ValueError:
+            continue
+    points.sort()
+    return points if len(points) >= 2 else parse_curve(DEFAULT_CURVE)
+
+
+def target_pct(lux, curve):
+    """Interpolate the curve on a log10(lux + 1) axis."""
+    x = math.log10(max(0.0, lux) + 1)
+    xs = [math.log10(l + 1) for l, _ in curve]
+    if x <= xs[0]:
+        return curve[0][1]
+    for (x0, (_, p0)), (x1, (_, p1)) in zip(zip(xs, curve), zip(xs[1:], curve[1:])):
+        if x <= x1:
+            return p0 + (p1 - p0) * (x - x0) / (x1 - x0)
+    return curve[-1][1]
+
+
+class Controller:
+    """Decides the next raw backlight value; no I/O, so it can be tested."""
+
+    def __init__(self, max_raw):
+        self.max_raw = max_raw
+        self.one_pct_raw = max(1, max_raw // 100)
+        self.light = None
+        self.last_set = None
+        self.ratio = 1.0
+
+    def step(self, lux, current_raw, curve):
+        self.light = lux if self.light is None else self.light + SMOOTHING * (lux - self.light)
+        base = target_pct(self.light, curve)
+        if self.last_set is not None and abs(current_raw - self.last_set) > 1:
+            # Changed by the user (or a restore after resume): learn the ratio.
+            self.last_set = current_raw
+            if current_raw >= self.one_pct_raw:
+                pct = 100 * current_raw / self.max_raw
+                self.ratio = min(4.0, max(0.25, pct / base))
+            return None
+        if current_raw < self.one_pct_raw:
+            self.last_set = current_raw   # fine steps below 1% are manual only
+            return None
+        want_pct = min(100.0, max(1.0, base * self.ratio))
+        want_raw = max(self.one_pct_raw, round(want_pct / 100 * self.max_raw))
+        if abs(want_raw - current_raw) < max(2, MIN_CHANGE * current_raw):
+            self.last_set = current_raw
+            return None
+        self.last_set = want_raw
+        return want_raw
+
+
+def find_sensor(root=Path("/sys/bus/iio/devices")):
+    for dev in sorted(root.glob("iio:device*")):
+        try:
+            if (dev / "name").read_text().strip() == "als" and (dev / "in_illuminance_raw").exists():
+                return dev / "in_illuminance_raw"
+        except OSError:
+            continue
+    return None
+
+
+def find_backlight(root=Path("/sys/class/backlight")):
+    for dev in sorted(root.iterdir()) if root.exists() else []:
+        if (dev / "brightness").exists():
+            return dev
+    return None
+
+
+def fade(path, start, end):
+    for i in range(1, FADE_STEPS + 1):
+        path.write_text(str(round(start + (end - start) * i / FADE_STEPS)))
+        time.sleep(FADE_S / FADE_STEPS)
+
+
+def main():
+    controller = None
+    while True:
+        conf = read_conf()
+        sensor, backlight = find_sensor(), find_backlight()
+        if conf.get("OMARCHY_AUTO_BRIGHTNESS", "1") != "1" or not sensor or not backlight:
+            controller = None
+            time.sleep(INTERVAL_S)
+            continue
+        try:
+            lux = float(sensor.read_text())
+            current = int((backlight / "brightness").read_text())
+            if controller is None:
+                controller = Controller(int((backlight / "max_brightness").read_text()))
+            want = controller.step(lux, current,
+                                   parse_curve(conf.get("OMARCHY_AUTO_BRIGHTNESS_CURVE", DEFAULT_CURVE)))
+            if want is not None:
+                fade(backlight / "brightness", current, want)
+        except (OSError, ValueError):
+            pass  # sensor not ready (e.g. right after resume); try again
+        time.sleep(INTERVAL_S)
+
+
+if __name__ == "__main__":
+    main()

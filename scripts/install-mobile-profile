@@ -47,6 +47,8 @@ put scripts/macbook-t1-radeon-off /usr/local/sbin/macbook-t1-radeon-off 0755
 put scripts/macbook-t1-brightness-control /usr/local/bin/macbook-t1-brightness-control 0755
 put scripts/macbook-t1-chromium-config /usr/local/bin/macbook-t1-chromium-config 0755
 put scripts/macbook-t1-kbd-backlight-auto /usr/local/bin/macbook-t1-kbd-backlight-auto 0755
+put scripts/macbook-t1-auto-brightness /usr/local/bin/macbook-t1-auto-brightness 0755
+put systemd/macbook-t1-auto-brightness.service /etc/systemd/system/macbook-t1-auto-brightness.service 0644
 install -d -m 0755 /usr/local/share/macbook-t1/chromium
 rm -rf /usr/local/share/macbook-t1/chromium/enhanced-h264ify
 cp -r "$repo_dir/chromium/enhanced-h264ify" /usr/local/share/macbook-t1/chromium/
@@ -99,6 +101,7 @@ runuser -u "$desktop_user" -- env XDG_RUNTIME_DIR="/run/user/$desktop_uid" \
   systemctl --user daemon-reload
 systemd-analyze verify systemd-suspend.service macbook-t1-radeon-off.service macbook-t1-touchbar-display.service
 systemctl enable --now macbook-t1-touchbar-display.service
+systemctl enable --now macbook-t1-auto-brightness.service
 systemctl enable macbook-t1-igd-boot-check.service macbook-t1-radeon-off.service macbook-t1-dri-symlinks.service
 echo "Mobile profile installed; previous files saved in $backup"
 echo 'Reboot to apply the lid policy, then verify sleep and wake on the physical laptop.'

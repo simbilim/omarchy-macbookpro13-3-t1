@@ -1,0 +1,12 @@
+[Unit]
+Description=Follow ambient light with the MacBookPro13,3 display brightness
+After=systemd-backlight@backlight:gmux_backlight.service
+
+[Service]
+ExecStart=/usr/local/bin/macbook-t1-auto-brightness
+Restart=on-failure
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
