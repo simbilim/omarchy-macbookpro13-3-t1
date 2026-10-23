@@ -51,5 +51,5 @@ if [[ -d /sys/module/macbook_t1_gmux_order ]]; then
   modprobe -r macbook_t1_gmux_order
 fi
 modprobe macbook_t1_gmux_order
-lsmod | grep -q '^macbook_t1_gmux_order '
+grep -q '^macbook_t1_gmux_order ' /proc/modules
 dkms status -m "$module"

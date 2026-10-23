@@ -30,7 +30,9 @@ Aanvulling 19 oktober (klep dicht, `Timekeeping suspended for`): met de remove/r
 
 Nachtmeting met de vereenvoudigde helper (19→20 oktober): 28,7 uur S3 op accu, 6996 → 6977 mAh (19 mAh), beide USB-C-controllers daarna aanwezig. Een klepcyclus van 3,1 s (klep direct weer open) liet beide Alpine Ridge-bomen zonder voeding; een PCI-rescan vond alleen de upstreambruggen terug. Herstel door een volgende lange S3 is nog niet getest.
 
-Open: herstel van USB-C na een te korte S3; `SOCW(0)` vóór slaap.
+Aanvulling 23 oktober: een S3 van ~6 s liet beide USB-C-controllers zonder voeding; de volgende klepcyclus verwijderde de dode bomen vóór S3 en na 432 s S3 gaf de rescan beide controllers terug ("2 of 2"), met werkende USB-ethernet. `macbook-t1-tb-nod3` verbiedt nu runtime-PM op beide USB-C-xHCI's zodra `xhci_hcd` bindt; een USB-ethernet werd daarmee direct na een verse boot, zonder slaapcyclus, herkend na uit- en insteken. `SOCW(0)` gaat als laatste stap vóór S3 via de `socw`-parameter van `macbook-t1-socw`; alle `SOCW(0)`/`SOCW(1)`-aanroepen gaven `0`.
+
+Open: geen blokkerende punten.
 
 ## Actuele analyse, 2 oktober 2026
 

@@ -51,5 +51,5 @@ if [[ -d /sys/module/macbook_t1_tb_nod3 ]]; then
   modprobe -r macbook_t1_tb_nod3
 fi
 modprobe macbook_t1_tb_nod3
-lsmod | grep -q '^macbook_t1_tb_nod3 '
+grep -q '^macbook_t1_tb_nod3 ' /proc/modules
 dkms status -m "$module"

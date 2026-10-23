@@ -151,6 +151,40 @@ quiesce_user_audio() {
   echo 'Quiesced user audio and closed CS8409 streams before closed-lid suspend'
 }
 
+# Built-in Alpine Ridge functions sit directly below the PEG1/PEG2 root ports.
+alpine_ridge_upstream_bridges() {
+  local dev
+  for dev in /sys/bus/pci/devices/0000:00:01.[12]/0000:*; do
+    [[ -e $dev/vendor ]] || continue
+    [[ $(<"$dev/vendor") == 0x8086 && $(<"$dev/device") == 0x1578 ]] || continue
+    echo "$dev"
+  done
+}
+
+usb_c_xhci_count() {
+  local dev n=0
+  for dev in /sys/bus/pci/devices/*; do
+    [[ $(<"$dev/vendor") == 0x8086 && $(<"$dev/device") == 0x15d4 ]] && n=$((n + 1))
+  done
+  echo "$n"
+}
+
+# Remove what is left of unpowered Alpine Ridge trees before S3, so resume
+# does not wait on dead bridges, and rescan after wake (restore).
+prepare_dead_usb_c_recovery() {
+  local bridge
+  (( $(usb_c_xhci_count) < 2 )) || return 0
+  for bridge in $(alpine_ridge_upstream_bridges); do
+    [[ -e $bridge/vendor && $(<"$bridge/vendor") == 0x8086 ]] || continue
+    # Leave a side alone if its xHCI is still alive.
+    compgen -G "$bridge/*/*/0000:*" >/dev/null &&
+      grep -qx 0x15d4 "$bridge"/*/*/device 2>/dev/null && continue
+    echo 1 > "$bridge/remove"
+  done
+  touch "$state/tb_rescan"
+  echo "USB-C controllers missing; rescanning after this sleep"
+}
+
 usb_c_devices_attached() {
   local hub xhci device
   for hub in /sys/bus/usb/devices/usb*; do
@@ -219,14 +253,13 @@ restore() {
     read -r value < "$state/pm_async"
     [[ $value =~ ^[01]$ ]] && echo "$value" > /sys/power/pm_async || rc=1
   fi
-  # After S3 the Alpine Ridge xHCIs are reinitialised but miss hot-plug
-  # events while runtime-suspended; keep them in D0. The macbook-t1-tb-nod3
-  # module keeps their bridges in D0 across sleep, which is what lets both
-  # USB-C trees survive S3 without being removed and rescanned.
-  for device in /sys/bus/pci/devices/*; do
-    [[ $(<"$device/vendor") == 0x8086 && $(<"$device/device") == 0x15d4 ]] || continue
-    echo on > "$device/power/control" || rc=1
-  done
+  # A too-short S3 leaves both Alpine Ridge controllers unpowered until a
+  # later sleep of a few minutes powers them again; pre removed the dead
+  # trees, so look for them again.
+  if [[ -f $state/tb_rescan ]]; then
+    echo 1 > /sys/bus/pci/rescan || rc=1
+    echo "USB-C controllers after rescan: $(usb_c_xhci_count) of 2"
+  fi
   if [[ -f $state/brcmfmac_removed ]]; then
     modprobe brcmfmac || rc=1
   fi
@@ -291,6 +324,7 @@ case ${1:-} in
     if grep -qw "$mode" /sys/power/mem_sleep; then
       echo "$mode" > /sys/power/mem_sleep
     fi
+    prepare_dead_usb_c_recovery
     # Both modes need serial callbacks and the unused NHI driver removed. In
     # s2idle, leaving the NHI bound lets Apple firmware power down both Alpine
     # Ridge trees, which makes their USB controllers inaccessible on resume.
@@ -340,6 +374,14 @@ case ${1:-} in
         fi
         [[ $(awk '{print $NF}' "$spi_gpe") == masked ]]
       fi
+    fi
+    # Last step, so a failed preparation never leaves the T1 asleep.
+    # macOS tells the T1 the host is going to sleep (ASOC.SOCW(0)); the
+    # macbook-t1-socw module sends SOCW(1) after every resume.
+    if grep -q '\[deep\]' /sys/power/mem_sleep &&
+       [[ -w /sys/module/macbook_t1_socw/parameters/socw ]]; then
+      echo 0 > /sys/module/macbook_t1_socw/parameters/socw ||
+        echo 'WARN: SOCW(0) failed' >&2
     fi
     echo 'Prepared MacBook T1 suspend: EC lid wake enabled; closed-lid audio quiesced and xHCI/Apple SPI GPE wake suppressed'
     ;;

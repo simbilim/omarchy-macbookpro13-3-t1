@@ -51,5 +51,5 @@ if [[ -d /sys/module/macbook_t1_socw ]]; then
   modprobe -r macbook_t1_socw
 fi
 modprobe macbook_t1_socw
-lsmod | grep -q '^macbook_t1_socw '
+grep -q '^macbook_t1_socw ' /proc/modules
 dkms status -m "$module"
