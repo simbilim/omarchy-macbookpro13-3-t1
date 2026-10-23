@@ -11,8 +11,14 @@ FLAGS = [
     "--render-node-override=/dev/dri/by-path/pci-0000:00:02.0-render",
     "--use-gl=angle",
     "--use-angle=gl",
-    "--disable-accelerated-video-decode",
 ]
+# Intel VA-API (iHD) decodes H.264, HEVC and VP8 on this Skylake GPU; on
+# Wayland Chromium needs these features to use it. A 1080p60 H.264 test
+# video went from 410% to 146% Chromium CPU and 18.6 to 15.7 W on battery.
+# VP9 and AV1 (YouTube's default) still decode in software.
+VAAPI_FEATURES = ["AcceleratedVideoDecodeLinuxGL", "AcceleratedVideoDecodeLinuxZeroCopyGL"]
+# Left over from the Radeon era, when its VA-API lacked VP9/AV1.
+OBSOLETE = ("--disable-accelerated-video-decode",)
 
 
 def main():
@@ -24,9 +30,16 @@ def main():
     if p.is_symlink():
         sys.exit("Refusing symlinked Chromium flags")
     old = p.read_text() if p.exists() else ""
-    keys = tuple(f.split("=")[0] for f in FLAGS) + ("--disable-gpu",)
-    kept = [line for line in old.splitlines() if line.strip().split("=")[0] not in keys]
-    new = "\n".join(kept + FLAGS) + "\n"
+    keys = tuple(f.split("=")[0] for f in FLAGS) + ("--disable-gpu",) + OBSOLETE
+    kept, features = [], []
+    for line in old.splitlines():
+        key = line.strip().split("=")[0]
+        if key == "--enable-features":
+            features += [f for f in line.split("=", 1)[1].split(",") if f]
+        elif key not in keys:
+            kept.append(line)
+    features += [f for f in VAAPI_FEATURES if f not in features]
+    new = "\n".join(kept + ["--enable-features=" + ",".join(features)] + FLAGS) + "\n"
     if new == old:
         return
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -45,7 +58,7 @@ def main():
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
-    print("Chromium configured: Intel/OpenGL rendering; software video decoding")
+    print("Chromium configured: Intel/OpenGL rendering; VA-API video decoding")
 
 
 if __name__ == "__main__":

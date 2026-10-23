@@ -86,7 +86,7 @@ The preferred boot entry copies the generated LTS protocol, image path, hash and
 
 The maintenance helper limits Limine to two snapshot entries. It excludes the removed ordinary `linux` kernel and the redundant rescue kernel from snapshot submenus, leaving one LTS route per retained snapshot. This does not itself delete Btrfs snapshots; snapshot retention remains an explicit administrative choice.
 
-Chromium keeps GPU rendering enabled, explicitly selects the Radeon and ANGLE OpenGL, and uses software video decoding. Existing unrelated Chromium flags are retained, with a timestamped backup beside the file. The tested YouTube stream was 1080p60; the Radeon VA-API capabilities do not include VP9 or AV1. Close and reopen Chromium and its web apps to load changed flags.
+Chromium renders on the Intel GPU through ANGLE OpenGL and decodes video with Intel VA-API (iHD: H.264, HEVC, VP8; not VP9 or AV1). `macbook-t1-chromium-config` removes the old `--disable-accelerated-video-decode` from the Radeon era and adds the Wayland VA-API features to `--enable-features`, keeping other user flags, with a timestamped backup. A 1080p60 H.264 test video dropped from 410% to 146% Chromium CPU and from 18.6 to 15.7 W on battery. Close and reopen Chromium and its web apps to load changed flags.
 
 ## Touch Bar visible but buttons ignored, 2 October 2026
 
