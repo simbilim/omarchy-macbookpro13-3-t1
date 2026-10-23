@@ -389,6 +389,9 @@ case ${1:-} in
     # Light the panel first: the restore below (Wi-Fi and
     # Thunderbolt reloads, audio) takes about 1.5 s and the user is waiting.
     wake_user_displays
+    if [[ -x /usr/local/bin/macbook-t1-kbd-backlight-auto ]]; then
+      /usr/local/bin/macbook-t1-kbd-backlight-auto || true
+    fi
     # Finish the remaining wake steps even if part of the restore failed.
     post_rc=0
     restore || post_rc=$?

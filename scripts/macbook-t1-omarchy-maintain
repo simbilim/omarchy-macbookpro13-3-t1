@@ -594,6 +594,8 @@ trap 'rm -f "$tmp"' EXIT
 awk '
   $0 == "-- BEGIN MacBookPro13,3 T1 brightness" { skip=1; next }
   $0 == "-- END MacBookPro13,3 T1 brightness" { skip=0; next }
+  $0 == "-- BEGIN MacBookPro13,3 T1 lid keyboard light" { skip=1; next }
+  $0 == "-- END MacBookPro13,3 T1 lid keyboard light" { skip=0; next }
   skip { next }
   { print }
 ' "$path" >"$tmp"
@@ -617,6 +619,15 @@ hl.unbind("XF86MonBrightnessDown")
 o.bind("XF86MonBrightnessUp", "Brightness up (fine below 1%)", "/usr/local/bin/macbook-t1-brightness-control up", { locked = true, repeating = true })
 o.bind("XF86MonBrightnessDown", "Brightness down (fine below 1%)", "/usr/local/bin/macbook-t1-brightness-control down", { locked = true, repeating = true })
 -- END MacBookPro13,3 T1 brightness
+LUA
+fi
+if [[ -x /usr/local/bin/macbook-t1-kbd-backlight-auto ]] && command -v omarchy-hyprland-monitor-clamshell >/dev/null; then
+  cat >>"$tmp" <<'LUA'
+-- BEGIN MacBookPro13,3 T1 lid keyboard light
+-- Keep Omarchy's lid-open action and light the keyboard when it is dark.
+hl.unbind("switch:off:Lid Switch")
+o.bind("switch:off:Lid Switch", nil, "omarchy-hyprland-monitor-clamshell; /usr/local/bin/macbook-t1-kbd-backlight-auto", { locked = true })
+-- END MacBookPro13,3 T1 lid keyboard light
 LUA
 fi
 if ! cmp -s "$tmp" "$path"; then

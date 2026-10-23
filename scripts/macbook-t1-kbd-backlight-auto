@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Switch the keyboard backlight on when it is dark, on wake and on lid open.
+# It only ever switches the backlight on, and leaves a lit keyboard alone.
+#
+# Called by macbook-t1-sleep after resume (as root) and by the lid-open
+# binding in ~/.config/hypr/bindings.lua (as the desktop user).
+# Settings in /etc/macbook-t1-omarchy.conf:
+#   OMARCHY_KBD_AUTO_DARK   ambient light reading below which it is dark (default 20)
+#   OMARCHY_KBD_AUTO_LEVEL  keyboard brightness to use, 1-255 (default 64)
+set -euo pipefail
+
+conf=/etc/macbook-t1-omarchy.conf
+setting() { awk -F= -v key="$1" '$1 == key { print $2; exit }' "$conf" 2>/dev/null || true; }
+dark=$(setting OMARCHY_KBD_AUTO_DARK); [[ $dark =~ ^[0-9]+$ ]] || dark=20
+level=$(setting OMARCHY_KBD_AUTO_LEVEL); [[ $level =~ ^[0-9]+$ ]] && (( level >= 1 && level <= 255 )) || level=64
+
+led=""
+for candidate in /sys/class/leds/*kbd_backlight*; do
+  [[ -e $candidate ]] && { led=${candidate##*/}; break; }
+done
+als=""
+for dev in /sys/bus/iio/devices/iio:device*; do
+  [[ -r $dev/name && $(<"$dev/name") == als ]] && { als=$dev/in_illuminance_raw; break; }
+done
+[[ -n $led && -n $als ]] || exit 0
+
+(( $(brightnessctl -d "$led" get) == 0 )) || exit 0
+
+# The T1 sensor hub can need a moment after resume before it answers.
+light=""
+for _ in 1 2 3 4 5; do
+  light=$(cat "$als" 2>/dev/null || true)
+  [[ $light =~ ^[0-9]+$ ]] && break
+  sleep 0.4
+done
+[[ $light =~ ^[0-9]+$ ]] || exit 0
+
+if (( light < dark )); then
+  brightnessctl -d "$led" set "$level" >/dev/null
+  echo "Dark (ambient light $light < $dark): keyboard backlight on at $level"
+fi
