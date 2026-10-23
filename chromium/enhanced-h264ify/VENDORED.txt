@@ -1,0 +1,2 @@
+Vendored unchanged from https://github.com/alextrv/enhanced-h264ify at commit 16b206e (v2.2.1, MIT, see LICENSE).
+Loaded by scripts/macbook-t1-chromium-config so YouTube serves H.264, which the Skylake GPU decodes in hardware.

@@ -626,6 +626,13 @@ fi
 EOF
 }
 
+ensure_chromium_flags() {
+  # Omarchy updates and omarchy-refresh-chromium can rewrite the flags file.
+  [[ -x /usr/local/bin/macbook-t1-chromium-config ]] || return 0
+  runuser -u "$RUN_USER" -- env HOME="$USER_HOME" /usr/local/bin/macbook-t1-chromium-config ||
+    echo "WARN: macbook-t1-chromium-config failed"
+}
+
 ensure_omarchy_post_update_hook() {
   run_as_desktop_user <<'EOF'
 set -euo pipefail
@@ -1009,6 +1016,7 @@ fi
 ensure_hypr_graphics_block
 ensure_hypr_trackpad_block
 ensure_hypr_brightness_block
+ensure_chromium_flags
 ensure_hypr_key_latency_guard
 
 if [[ -x /usr/local/sbin/macbook-t1-gpu-pref ]]; then

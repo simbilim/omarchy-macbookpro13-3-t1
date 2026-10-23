@@ -45,6 +45,11 @@ put scripts/macbook-t1-gpu-pref /usr/local/sbin/macbook-t1-gpu-pref 0755
 put scripts/macbook-t1-igd-boot-check /usr/local/sbin/macbook-t1-igd-boot-check 0755
 put scripts/macbook-t1-radeon-off /usr/local/sbin/macbook-t1-radeon-off 0755
 put scripts/macbook-t1-brightness-control /usr/local/bin/macbook-t1-brightness-control 0755
+put scripts/macbook-t1-chromium-config /usr/local/bin/macbook-t1-chromium-config 0755
+install -d -m 0755 /usr/local/share/macbook-t1/chromium
+rm -rf /usr/local/share/macbook-t1/chromium/enhanced-h264ify
+cp -r "$repo_dir/chromium/enhanced-h264ify" /usr/local/share/macbook-t1/chromium/
+chmod -R u=rwX,go=rX /usr/local/share/macbook-t1/chromium/enhanced-h264ify
 put systemd/macbook-t1-igd-boot-check.service /etc/systemd/system/macbook-t1-igd-boot-check.service 0644
 put systemd/macbook-t1-radeon-off.service /etc/systemd/system/macbook-t1-radeon-off.service 0644
 put scripts/dri-symlinks /usr/local/sbin/macbook-t1-dri-symlinks 0755
