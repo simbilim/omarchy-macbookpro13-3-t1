@@ -220,13 +220,21 @@ install -D -m 0644 "$config_tmp" /etc/macbook-t1-omarchy.conf
 rm -f "$config_tmp"
 
 install -D -m 0755 "$repo_dir/scripts/macbook-t1-omarchy-maintain" /usr/local/sbin/macbook-t1-omarchy-maintain
+install -D -m 0755 "$repo_dir/scripts/macbook-t1-chromium-config" /usr/local/bin/macbook-t1-chromium-config
 install -D -m 0755 "$repo_dir/scripts/limine-unattended-fix" /usr/local/sbin/macbook-t1-limine-unattended-fix
 install -D -m 0755 "$repo_dir/scripts/dri-symlinks" /usr/local/sbin/macbook-t1-dri-symlinks
 install -D -m 0755 "$repo_dir/scripts/install-audio-dkms" /usr/local/sbin/macbook-t1-install-audio-dkms
+install -D -m 0644 "$repo_dir/patches/cs8409-resume-pr220.patch" /usr/local/share/macbook-t1/patches/cs8409-resume-pr220.patch
 install -D -m 0755 "$repo_dir/scripts/install-ec-wake-dkms" /usr/local/sbin/macbook-t1-install-ec-wake-dkms
 install -D -m 0755 "$repo_dir/scripts/macbook-t1-gpu-pref" /usr/local/sbin/macbook-t1-gpu-pref
 install -D -m 0755 "$repo_dir/scripts/macbook-t1-igd-boot-check" /usr/local/sbin/macbook-t1-igd-boot-check
 install -D -m 0755 "$repo_dir/scripts/macbook-t1-radeon-off" /usr/local/sbin/macbook-t1-radeon-off
+install -D -m 0644 "$repo_dir/chromium/policies/recommended/macbook-t1-memory-saver.json" /etc/chromium/policies/recommended/macbook-t1-memory-saver.json
+install -D -m 0644 "$repo_dir/chromium/policies/recommended/macbook-t1-lean-browser.json" /etc/chromium/policies/recommended/macbook-t1-lean-browser.json
+if command -v brave >/dev/null 2>&1; then
+  install -D -m 0644 "$repo_dir/chromium/policies/recommended/macbook-t1-memory-saver.json" /etc/brave/policies/recommended/macbook-t1-memory-saver.json
+  install -D -m 0644 "$repo_dir/chromium/policies/recommended/macbook-t1-lean-browser.json" /etc/brave/policies/recommended/macbook-t1-lean-browser.json
+fi
 
 install -D -m 0644 "$repo_dir/hooks/pacman/99-macbook-t1-omarchy-maintain.hook" /etc/pacman.d/hooks/99-macbook-t1-omarchy-maintain.hook
 install -D -m 0644 "$repo_dir/systemd/macbook-t1-igd-boot-check.service" /etc/systemd/system/macbook-t1-igd-boot-check.service

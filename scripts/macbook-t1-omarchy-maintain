@@ -560,11 +560,13 @@ awk '
 perl -0pi -e 's/\n+\z/\n/' "$tmp"
 cat >>"$tmp" <<'LUA'
 -- BEGIN MacBookPro13,3 T1 trackpad
--- Keep palm contact from grabbing and dragging windows while typing.
+-- Require a physical click and keep palm contact from changing focus.
 hl.config({
   input = {
+    follow_mouse = 0,
     touchpad = {
       disable_while_typing = true,
+      tap_to_click = false,
       tap_and_drag = false,
     },
   },
@@ -637,11 +639,59 @@ fi
 EOF
 }
 
-ensure_chromium_flags() {
-  # Omarchy updates and omarchy-refresh-chromium can rewrite the flags file.
+ensure_browser_flags() {
+  # Omarchy updates and browser refreshes can rewrite the flags files.
   [[ -x /usr/local/bin/macbook-t1-chromium-config ]] || return 0
   runuser -u "$RUN_USER" -- env HOME="$USER_HOME" /usr/local/bin/macbook-t1-chromium-config ||
     echo "WARN: macbook-t1-chromium-config failed"
+  if command -v brave >/dev/null 2>&1; then
+    runuser -u "$RUN_USER" -- env HOME="$USER_HOME" /usr/local/bin/macbook-t1-chromium-config brave ||
+      echo "WARN: macbook-t1-chromium-config brave failed"
+  fi
+}
+
+run_local_hooks() {
+  # Machine-specific additions that do not belong in the shared kit. Only
+  # root-owned executables that others cannot write are run.
+  local dir=/etc/macbook-t1-omarchy/local.d hook mode
+  [[ -d $dir && ! -L $dir ]] || return 0
+  for hook in "$dir"/*; do
+    [[ -f $hook && -x $hook && ! -L $hook ]] || continue
+    mode="$(stat -c '%a' "$hook")"
+    if [[ "$(stat -c '%u' "$hook")" != 0 ]] || (( (8#$mode & 022) != 0 )); then
+      echo "WARN: skipping unsafe local hook: $hook"
+      continue
+    fi
+    "$hook" || echo "WARN: local hook failed: $hook"
+  done
+}
+
+ensure_speaker_dsp() {
+  # Four-driver speaker DSP (pipewire/93-macbook-t1-speaker-dsp.conf). /etc
+  # files are not package-owned, so updates keep them; this guards the parts
+  # an update or an Omarchy migration can still break.
+  local conf=/etc/pipewire/pipewire.conf.d/93-macbook-t1-speaker-dsp.conf stale
+  [[ -f $conf ]] || return 0
+  # The older stereo protection would stack a second filter in front.
+  for stale in 91-macbook-t1-speaker-protect.conf 92-macbook-t1-speaker-dsp-4ch.conf; do
+    if [[ -f /etc/pipewire/pipewire.conf.d/$stale ]]; then
+      rm -f "/etc/pipewire/pipewire.conf.d/$stale"
+      echo "removed: /etc/pipewire/pipewire.conf.d/$stale"
+    fi
+  done
+  [[ -f /usr/lib/lv2/lsp-plugins.lv2/limiter_stereo.ttl ]] ||
+    echo "WARN: lsp-plugins-lv2 missing; the MacBook Speakers sink cannot load (pacman -S lsp-plugins-lv2)"
+  [[ -x /usr/local/bin/macbook-t1-speaker-router ]] ||
+    echo "WARN: /usr/local/bin/macbook-t1-speaker-router missing; rerun install-mobile-profile"
+  if [[ -f /etc/systemd/user/macbook-t1-speaker-router.service ]] &&
+    ! systemctl --global is-enabled --quiet macbook-t1-speaker-router.service; then
+    systemctl --global enable macbook-t1-speaker-router.service ||
+      echo "WARN: could not enable macbook-t1-speaker-router.service"
+  fi
+  # An Omarchy speaker tuning for this model would add a second DSP stage.
+  if [[ -e $USER_HOME/.config/pipewire/omarchy-speaker-tuning.conf.d/90-tuning.conf ]]; then
+    echo "WARN: Omarchy speaker tuning is installed next to the MacBook DSP; run omarchy-audio-tuning off"
+  fi
 }
 
 ensure_omarchy_post_update_hook() {
@@ -1027,8 +1077,10 @@ fi
 ensure_hypr_graphics_block
 ensure_hypr_trackpad_block
 ensure_hypr_brightness_block
-ensure_chromium_flags
+ensure_browser_flags
+ensure_speaker_dsp
 ensure_hypr_key_latency_guard
+run_local_hooks
 
 if [[ -x /usr/local/sbin/macbook-t1-gpu-pref ]]; then
   gpu_status=$(/usr/local/sbin/macbook-t1-gpu-pref status)

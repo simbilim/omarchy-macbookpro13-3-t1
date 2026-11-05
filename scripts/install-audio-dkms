@@ -6,6 +6,8 @@ driver_commit="${AUDIO_DRIVER_COMMIT:-89b22ff90b86468b186706861dd18663562defa7}"
 source_dir="${AUDIO_DRIVER_SOURCE_DIR:-/opt/macbook-t1/snd_hda_macbookpro-$driver_commit}"
 dkms_source="/usr/src/snd_hda_macbookpro-0.1"
 managed_marker=".macbook-t1-omarchy-managed"
+resume_patch="/usr/local/share/macbook-t1/patches/cs8409-resume-pr220.patch"
+resume_patch_sha256="c170d021b696c72bdc21f160ad0eaf0351a7e0488fa73750b1a2d6ac280193c2"
 
 if (( EUID != 0 )); then
   exec sudo bash "$0" "$@"
@@ -80,6 +82,14 @@ if [[ "$actual_commit" != "$driver_commit" ]]; then
 fi
 if [[ -n "$(git -C "$staging" status --porcelain --untracked-files=all)" ]]; then
   fail "refusing dirty audio driver staging checkout"
+fi
+
+if [[ "$driver_commit" == "89b22ff90b86468b186706861dd18663562defa7" ]]; then
+  [[ -f "$resume_patch" ]] || fail "missing CS8409 resume patch: $resume_patch"
+  printf '%s  %s\n' "$resume_patch_sha256" "$resume_patch" | sha256sum --check --status ||
+    fail "CS8409 resume patch checksum mismatch: $resume_patch"
+  git -C "$staging" apply --check "$resume_patch" || fail "CS8409 resume patch does not apply"
+  git -C "$staging" apply "$resume_patch"
 fi
 
 printf 'driver_url=%s\ndriver_commit=%s\n' "$driver_url" "$driver_commit" >"$staging/$managed_marker"

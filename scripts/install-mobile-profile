@@ -68,8 +68,12 @@ put systemd/user/xdg-desktop-portal-hyprland-pipewire.conf /etc/systemd/user/xdg
 put mkinitcpio/zz-macbook-t1-early-kms.conf /etc/mkinitcpio.conf.d/zz-macbook-t1-early-kms.conf 0644
 put limine-entry-tool.d/macbook13-stability.conf /etc/limine-entry-tool.d/macbook13-stability.conf 0644
 put pipewire/90-macbook-t1-cs8409-rate.conf /etc/pipewire/pipewire.conf.d/90-macbook-t1-cs8409-rate.conf 0644
-put pipewire/91-macbook-t1-speaker-protect.conf /etc/pipewire/pipewire.conf.d/91-macbook-t1-speaker-protect.conf 0644
+pacman -S --needed --noconfirm lsp-plugins-lv2
+put pipewire/93-macbook-t1-speaker-dsp.conf /etc/pipewire/pipewire.conf.d/93-macbook-t1-speaker-dsp.conf 0644
+put scripts/macbook-t1-speaker-router /usr/local/bin/macbook-t1-speaker-router 0755
+put systemd/macbook-t1-speaker-router.service /etc/systemd/user/macbook-t1-speaker-router.service 0644
 put libinput/local-overrides.quirks /etc/libinput/local-overrides.quirks 0644
+rm -f /etc/pipewire/pipewire.conf.d/91-macbook-t1-speaker-protect.conf
 rm -f /etc/pipewire/pipewire.conf.d/92-macbook-t1-speaker-dsp-4ch.conf
 rm -f /etc/systemd/sleep.conf.d/91-macbook-t1-s2idle.conf
 rm -f /etc/systemd/logind.conf.d/91-macbook-t1-s2idle.conf
@@ -102,6 +106,7 @@ runuser -u "$desktop_user" -- env XDG_RUNTIME_DIR="/run/user/$desktop_uid" \
 systemd-analyze verify systemd-suspend.service macbook-t1-radeon-off.service macbook-t1-touchbar-display.service
 systemctl enable --now macbook-t1-touchbar-display.service
 systemctl enable --now macbook-t1-auto-brightness.service
+systemctl --global enable macbook-t1-speaker-router.service
 systemctl enable macbook-t1-igd-boot-check.service macbook-t1-radeon-off.service macbook-t1-dri-symlinks.service
 echo "Mobile profile installed; previous files saved in $backup"
 echo 'Reboot to apply the lid policy, then verify sleep and wake on the physical laptop.'

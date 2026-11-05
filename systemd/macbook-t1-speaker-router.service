@@ -1,0 +1,12 @@
+[Unit]
+Description=MacBook T1 built-in audio router (headphones vs 4-driver speaker DSP)
+After=pipewire-pulse.service wireplumber.service
+Wants=pipewire-pulse.service wireplumber.service
+
+[Service]
+ExecStart=/usr/local/bin/macbook-t1-speaker-router
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

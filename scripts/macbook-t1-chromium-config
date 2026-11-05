@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the tested Chromium renderer settings as the desktop user."""
+"""Apply tested Chromium-family renderer settings as the desktop user."""
 from datetime import datetime
 import os
 from pathlib import Path
@@ -25,13 +25,16 @@ OBSOLETE = ("--disable-accelerated-video-decode",)
 
 
 def main():
+    if len(sys.argv) > 2 or (len(sys.argv) == 2 and sys.argv[1] not in ("chromium", "brave")):
+        sys.exit("Usage: macbook-t1-chromium-config [chromium|brave]")
+    browser = sys.argv[1] if len(sys.argv) == 2 else "chromium"
     if os.geteuid() == 0:
         sys.exit("Run as the Omarchy desktop user, without sudo")
     if Path("/sys/class/dmi/id/product_name").read_text().strip() != "MacBookPro13,3":
         sys.exit("Unsupported model")
-    p = Path.home() / ".config/chromium-flags.conf"
+    p = Path.home() / f".config/{browser}-flags.conf"
     if p.is_symlink():
-        sys.exit("Refusing symlinked Chromium flags")
+        sys.exit(f"Refusing symlinked {browser} flags")
     old = p.read_text() if p.exists() else ""
     keys = tuple(f.split("=")[0] for f in FLAGS) + ("--disable-gpu",) + OBSOLETE
     kept, features, extensions = [], [], []
@@ -65,7 +68,7 @@ def main():
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
-    print("Chromium configured: Intel/OpenGL rendering; VA-API video decoding; YouTube H.264")
+    print(f"{browser.capitalize()} configured: Intel/OpenGL rendering; VA-API video decoding; YouTube H.264")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Route built-in audio on the MacBookPro13,3 (CS8409):
+#   headphones plugged in -> stereo profile (only profile with a headphone port)
+#   no headphones         -> 4.0 profile feeding the "MacBook Speakers" DSP sink
+# Leaves the default sink alone when it is not a built-in sink (Bluetooth, USB, ...).
+set -u
+
+CARD=alsa_card.pci-0000_00_1f.3
+STEREO_PROFILE=output:analog-stereo+input:analog-stereo
+SPEAKER_PROFILE=output:analog-surround-40+input:analog-stereo
+STEREO_SINK=alsa_output.pci-0000_00_1f.3.analog-stereo
+DSP_SINK=macbook_t1_speakers
+# Omarchy's volume keys resolve through the DSP sink to the hardware sink
+# (omarchy-audio-output-sink), so the DSP input level is a fixed gain stage.
+# 50% (-18 dB) was tested crackle-free with the hardware sink at 100%.
+DSP_VOLUME=50%
+
+log() { echo "speaker-router: $*"; }
+
+card_block() { pactl list cards | awk -v c="Name: $CARD" '$0 ~ c {p=1} p && /^Card #/ && !($0 ~ c) {exit} p'; }
+
+headphones_present() {
+    card_block | grep -E '^\s+analog-output-headphones:' | grep -qv 'not available'
+}
+
+active_profile() { card_block | awk '/Active Profile:/{print $3}'; }
+
+default_is_builtin() {
+    local d; d=$(pactl get-default-sink 2>/dev/null)
+    [[ -z "$d" || "$d" == alsa_output.pci-0000_00_1f.3.* || "$d" == "$DSP_SINK" || "$d" == macbook_t1_* ]]
+}
+
+wait_for_sink() {
+    for _ in $(seq 1 30); do
+        pactl list sinks short | awk '{print $2}' | grep -qx "$1" && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
+apply() {
+    local want sink prof
+    if headphones_present; then want=$STEREO_PROFILE; sink=$STEREO_SINK
+    else want=$SPEAKER_PROFILE; sink=$DSP_SINK; fi
+    prof=$(active_profile)
+    [[ -z "$prof" ]] && return
+    if [[ "$prof" != "$want" ]]; then
+        log "profile $prof -> $want"
+        pactl set-card-profile "$CARD" "$want"
+    fi
+    if [[ $sink == "$DSP_SINK" ]] && wait_for_sink "$DSP_SINK"; then
+        pactl get-sink-volume "$DSP_SINK" | grep -q " $DSP_VOLUME " ||
+            { log "DSP input volume -> $DSP_VOLUME"; pactl set-sink-volume "$DSP_SINK" "$DSP_VOLUME"; }
+    fi
+    if default_is_builtin && wait_for_sink "$sink" && [[ "$(pactl get-default-sink)" != "$sink" ]]; then
+        log "default sink -> $sink"
+        pactl set-default-sink "$sink"
+    fi
+}
+
+apply
+pactl subscribe | while read -r line; do
+    case "$line" in
+        *"on card"*) apply ;;
+    esac
+done
